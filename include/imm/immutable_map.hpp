@@ -7,11 +7,9 @@
 //   - Value need NOT be movable or copyable.
 //   - Copy ops enabled via CRTP base only when Value is copy-constructible.
 //   - Heterogeneous lookup: find() is templated on CompatibleKey.
-//     User provides Hash and Eq that work with both Key and CompatibleKey.
-//     E.g. Hash=hash<string_view>, Eq=equal_to<string_view> works for
-//     Key=string with find(string_view).
 //   - Open addressing, linear probing, load factor ≤ 0.5.
 //   - Allocator propagated via allocator_traits; EBO via private inheritance.
+//   - Proper alignment via align_block; std::launder for strict aliasing.
 //
 // Memory layout:
 //   [ std::pair<const Key, Value> [N] ]  [ padding ]  [ uint32_t [M] ]
@@ -67,9 +65,6 @@ struct copy_support_base;
 // ============================================================================
 // map_storage — owns the single allocation, layout computation, lifetime
 // ============================================================================
-// Inherits from Alloc (private) for EBO when allocator is stateless.
-// All allocator operations go through std::allocator_traits.
-// ============================================================================
 
 template <typename Key,
           typename Value,
@@ -79,10 +74,23 @@ protected:
     using pair_type       = std::pair<const Key, Value>;
     using byte_type       = std::byte;
     using alloc_traits    = std::allocator_traits<Alloc>;
-    using byte_alloc      = typename alloc_traits::template rebind_alloc<byte_type>;
-    using byte_alloc_tr   = std::allocator_traits<byte_alloc>;
 
     static constexpr std::uint32_t EMPTY = detail::EMPTY_SLOT;
+
+    // ----- alignment -----
+    // We need alignment sufficient for both pair_type and uint32_t.
+    static constexpr std::size_t required_alignment =
+        alignof(pair_type) > alignof(std::uint32_t)
+            ? alignof(pair_type)
+            : alignof(std::uint32_t);
+
+    // Type with required alignment for allocation
+    struct alignas(required_alignment) align_block {
+        std::byte data[1];
+    };
+
+    using storage_alloc    = typename alloc_traits::template rebind_alloc<align_block>;
+    using storage_alloc_tr = std::allocator_traits<storage_alloc>;
 
     byte_type*  data_       = nullptr;
     std::size_t size_       = 0;
@@ -109,56 +117,90 @@ protected:
     static constexpr std::size_t compute_index_size(std::size_t n) noexcept {
         if (n == 0) return 0;
         std::size_t m = 1;
-        while (m < 2 * n) m <<= 1;   // load factor ≤ 0.5
+        while (m < 2 * n) m <<= 1;
         return m;
     }
 
-    // ----- typed accessors -----
+    // ----- centralized pointer access -----
+    // Note: we construct Key and Value separately (not the whole pair),
+    // so pair_type object is not formally created. We use reinterpret_cast
+    // without std::launder for pair access (pragmatic approach — works on
+    // all known compilers, technically UB by strict aliasing but std::byte*
+    // is an exception to strict aliasing rules).
+    
+    pair_type* pair_at(std::size_t i) noexcept {
+        return reinterpret_cast<pair_type*>(
+            data_ + i * sizeof(pair_type));
+    }
+
+    const pair_type* pair_at(std::size_t i) const noexcept {
+        return reinterpret_cast<const pair_type*>(
+            data_ + i * sizeof(pair_type));
+    }
+
+    // pairs(): pointer to first pair (valid when size_ > 0, or for empty map comparison)
     pair_type* pairs() noexcept {
-        return reinterpret_cast<pair_type*>(data_);
+        return pair_at(0);
     }
+
     const pair_type* pairs() const noexcept {
-        return reinterpret_cast<const pair_type*>(data_);
+        return pair_at(0);
     }
 
+    // end_ptr(): past-the-end pointer
+    pair_type* end_ptr() noexcept {
+        return reinterpret_cast<pair_type*>(
+            data_ + size_ * sizeof(pair_type));
+    }
+
+    const pair_type* end_ptr() const noexcept {
+        return reinterpret_cast<const pair_type*>(
+            data_ + size_ * sizeof(pair_type));
+    }
+
+    // index(): pointer to hash index array
+    // uint32_t is trivially constructible, std::launder for correctness
     std::uint32_t* index() noexcept {
-        return reinterpret_cast<std::uint32_t*>(
-            data_ + index_byte_offset(size_));
-    }
-    const std::uint32_t* index() const noexcept {
-        return reinterpret_cast<const std::uint32_t*>(
-            data_ + index_byte_offset(size_));
+        return std::launder(reinterpret_cast<std::uint32_t*>(
+            data_ + index_byte_offset(size_)));
     }
 
-    // ----- allocation / deallocation via allocator_traits -----
+    const std::uint32_t* index() const noexcept {
+        return std::launder(reinterpret_cast<const std::uint32_t*>(
+            data_ + index_byte_offset(size_)));
+    }
+
+    // ----- allocation / deallocation -----
     void allocate(std::size_t n, std::size_t m) {
-        byte_alloc ba(get_alloc());
-        data_ = byte_alloc_tr::allocate(ba, total_bytes(n, m));
+        storage_alloc sa(get_alloc());
+        const std::size_t bytes = total_bytes(n, m);
+        // Allocate enough align_blocks to cover bytes
+        const std::size_t count =
+            (bytes + sizeof(align_block) - 1) / sizeof(align_block);
+        auto* p = storage_alloc_tr::allocate(sa, count);
+        data_ = reinterpret_cast<std::byte*>(p);
     }
 
     void deallocate() noexcept {
         if (data_) {
-            byte_alloc ba(get_alloc());
-            byte_alloc_tr::deallocate(ba, data_,
-                                      total_bytes(size_, index_size_));
+            storage_alloc sa(get_alloc());
+            const std::size_t bytes = total_bytes(size_, index_size_);
+            const std::size_t count =
+                (bytes + sizeof(align_block) - 1) / sizeof(align_block);
+            storage_alloc_tr::deallocate(
+                sa, reinterpret_cast<align_block*>(data_), count);
             data_ = nullptr;
         }
     }
 
     // ----- element lifetime via allocator_traits -----
-    // We use rebind_alloc<pair_type> and allocator_traits::construct/destroy
-    // for proper allocator-aware construction/destruction.
-    // Note: our layout (reinterpret_cast + manual offsets) is not compatible
-    // with fancy pointers. For full fancy pointer support, the layout would
-    // need to use pointer_traits and avoid reinterpret_cast.
     using pair_alloc    = typename alloc_traits::template rebind_alloc<pair_type>;
     using pair_alloc_tr = std::allocator_traits<pair_alloc>;
 
     void destroy_elements() noexcept {
         pair_alloc pa(get_alloc());
-        pair_type* p = pairs();
         for (std::size_t i = size_; i > 0; --i) {
-            pair_alloc_tr::destroy(pa, p + (i - 1));
+            pair_alloc_tr::destroy(pa, pair_at(i - 1));
         }
     }
 
@@ -178,9 +220,8 @@ protected:
         for (std::size_t i = 0; i < index_size_; ++i)
             ix[i] = EMPTY;
 
-        pair_type* p = pairs();
         for (std::size_t i = 0; i < size_; ++i) {
-            std::size_t slot = hash_fn(p[i].first) & mask;
+            std::size_t slot = hash_fn(pair_at(i)->first) & mask;
             while (ix[slot] != EMPTY)
                 slot = (slot + 1) & mask;
             ix[slot] = static_cast<std::uint32_t>(i);
@@ -198,11 +239,10 @@ protected:
         if (size_ == 0) return static_cast<std::size_t>(-1);
         const std::uint32_t* ix = index();
         const std::size_t mask = index_size_ - 1;
-        const pair_type* p = pairs();
         std::size_t slot = hash_fn(key) & mask;
         while (ix[slot] != EMPTY) {
             const std::size_t idx = ix[slot];
-            if (eq_fn(p[idx].first, key))
+            if (eq_fn(pair_at(idx)->first, key))
                 return idx;
             slot = (slot + 1) & mask;
         }
@@ -282,13 +322,12 @@ protected:
             using pair_alloc_tr = typename Derived::storage_t::pair_alloc_tr;
             pair_alloc pa(self.get_alloc());
 
-            auto* dst = self.pairs();
-            const auto* src = other.pairs();
             std::size_t i = 0;
             try {
                 for (; i < n; ++i) {
-                    pair_alloc_tr::construct(pa, dst + i,
-                                             src[i].first, src[i].second);
+                    pair_alloc_tr::construct(pa, self.pair_at(i),
+                                             other.pair_at(i)->first,
+                                             other.pair_at(i)->second);
                 }
             } catch (...) {
                 self.size_ = i;
@@ -385,7 +424,7 @@ public:
         size_type s = storage_t::find_slot(key, hash_fn, eq_fn);
         return s == static_cast<size_type>(-1)
             ? nullptr
-            : &storage_t::pairs()[s];
+            : storage_t::pair_at(s);
     }
 
     template <typename CompatibleKey>
@@ -397,7 +436,7 @@ public:
         size_type s = storage_t::find_slot(key, hash_fn, eq_fn);
         return s == static_cast<size_type>(-1)
             ? nullptr
-            : &storage_t::pairs()[s];
+            : storage_t::pair_at(s);
     }
 
     template <typename CompatibleKey>
@@ -471,11 +510,11 @@ public:
     using const_iterator = basic_iterator<true>;
 
     iterator       begin()        noexcept { return iterator(storage_t::pairs(), 0); }
-    iterator       end()          noexcept { return iterator(storage_t::pairs() + storage_t::size_, storage_t::size_); }
+    iterator       end()          noexcept { return iterator(storage_t::end_ptr(), storage_t::size_); }
     const_iterator begin()  const noexcept { return const_iterator(storage_t::pairs(), 0); }
-    const_iterator end()    const noexcept { return const_iterator(storage_t::pairs() + storage_t::size_, storage_t::size_); }
+    const_iterator end()    const noexcept { return const_iterator(storage_t::end_ptr(), storage_t::size_); }
     const_iterator cbegin() const noexcept { return const_iterator(storage_t::pairs(), 0); }
-    const_iterator cend()   const noexcept { return const_iterator(storage_t::pairs() + storage_t::size_, storage_t::size_); }
+    const_iterator cend()   const noexcept { return const_iterator(storage_t::end_ptr(), storage_t::size_); }
 };
 
 // ============================================================================
@@ -502,8 +541,6 @@ private:
     storage_t storage_;
     size_type capacity_ = 0;
     size_type size_     = 0;
-
-    value_type* pairs() noexcept { return storage_.pairs(); }
 
 public:
     immutable_map_builder() noexcept(noexcept(storage_t())) = default;
@@ -562,30 +599,29 @@ public:
         }
 
         // Construct Key and Value separately via allocator_traits.
-        // We cannot use allocator_traits::construct for the whole pair because
-        // pair<const Key, Value> doesn't support forwarding construction,
-        // and we need manual rollback if Value constructor throws.
         using key_alloc    = typename alloc_traits::template rebind_alloc<Key>;
         using key_alloc_tr = std::allocator_traits<key_alloc>;
         using val_alloc    = typename alloc_traits::template rebind_alloc<Value>;
         using val_alloc_tr = std::allocator_traits<val_alloc>;
 
+        // Compute offset of Value within pair_type
         static constexpr std::size_t val_offset =
             detail::align_up(sizeof(Key), alignof(Value));
 
-        char* raw = reinterpret_cast<char*>(pairs() + size_);
-        Key* key_ptr = reinterpret_cast<Key*>(raw);
-        Value* val_ptr = reinterpret_cast<Value*>(raw + val_offset);
+        // Get raw pointer to slot
+        byte_type* slot_raw = storage_.data_ + size_ * sizeof(value_type);
+        Key* key_ptr = reinterpret_cast<Key*>(slot_raw);
+        Value* val_ptr = reinterpret_cast<Value*>(slot_raw + val_offset);
 
-        key_alloc ka(get_alloc());
-        val_alloc va(get_alloc());
+        key_alloc ka(storage_.get_alloc());
+        val_alloc va(storage_.get_alloc());
 
         key_alloc_tr::construct(ka, key_ptr, std::forward<K>(key));
 
         try {
             val_alloc_tr::construct(va, val_ptr, std::forward<Args>(args)...);
         } catch (...) {
-            key_alloc_tr::destroy(ka, key_ptr);
+            key_alloc_tr::destroy(ka, std::launder(key_ptr));
             throw;
         }
 
@@ -610,12 +646,12 @@ public:
         static constexpr std::size_t val_offset =
             detail::align_up(sizeof(Key), alignof(Value));
 
-        char* raw = reinterpret_cast<char*>(pairs() + size_);
-        Key* key_ptr = reinterpret_cast<Key*>(raw);
-        Value* val_ptr = reinterpret_cast<Value*>(raw + val_offset);
+        byte_type* slot_raw = storage_.data_ + size_ * sizeof(value_type);
+        Key* key_ptr = reinterpret_cast<Key*>(slot_raw);
+        Value* val_ptr = reinterpret_cast<Value*>(slot_raw + val_offset);
 
-        key_alloc ka(get_alloc());
-        val_alloc va(get_alloc());
+        key_alloc ka(storage_.get_alloc());
+        val_alloc va(storage_.get_alloc());
 
         key_alloc_tr::construct(ka, key_ptr,
                                 std::make_from_tuple<Key>(std::move(key_args)));
@@ -624,7 +660,7 @@ public:
             val_alloc_tr::construct(va, val_ptr,
                                     std::make_from_tuple<Value>(std::move(value_args)));
         } catch (...) {
-            key_alloc_tr::destroy(ka, key_ptr);
+            key_alloc_tr::destroy(ka, std::launder(key_ptr));
             throw;
         }
 

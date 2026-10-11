@@ -200,19 +200,23 @@ export default function App() {
             </div>
 
             <div className="bg-slate-900 border border-slate-800 rounded-lg p-5">
-              <h3 className="text-white font-semibold mb-3">Allocator: EBO + traits</h3>
+              <h3 className="text-white font-semibold mb-3">Allocator: EBO + traits + alignment</h3>
               <ul className="text-slate-300 text-sm space-y-2">
                 <li className="flex gap-2">
                   <span className="text-emerald-400 shrink-0">•</span>
-                  <span><code className="text-sky-300">map_storage</code> inherits from <code className="text-sky-300">Alloc</code> privately — EBO for stateless allocators (zero overhead)</span>
+                  <span><code className="text-sky-300">map_storage</code> inherits from <code className="text-sky-300">Alloc</code> privately — EBO for stateless allocators</span>
                 </li>
                 <li className="flex gap-2">
                   <span className="text-emerald-400 shrink-0">•</span>
-                  <span>All allocation/deallocation via <code className="text-sky-300">std::allocator_traits</code></span>
+                  <span>All ops via <code className="text-sky-300">std::allocator_traits</code>, construct/destroy included</span>
                 </li>
                 <li className="flex gap-2">
                   <span className="text-emerald-400 shrink-0">•</span>
-                  <span>Rebind to <code className="text-sky-300">std::byte</code> for raw memory</span>
+                  <span>Rebind to <code className="text-sky-300">align_block</code> (alignas max(pair_type, uint32_t)) — correct alignment guaranteed</span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="text-emerald-400 shrink-0">•</span>
+                  <span><code className="text-sky-300">std::launder</code> for index access; pair access via <code className="text-sky-300">reinterpret_cast</code> (pragmatic — pair not formally created as whole)</span>
                 </li>
                 <li className="flex gap-2">
                   <span className="text-emerald-400 shrink-0">•</span>
@@ -255,6 +259,46 @@ try {
 }
 ++size_;`}
             />
+          </div>
+
+          <div className="mt-6 bg-slate-900 border border-slate-800 rounded-lg p-5">
+            <h3 className="text-white font-semibold mb-3">Alignment &amp; std::launder</h3>
+            <p className="text-slate-300 text-sm mb-3">
+              Ключевая проблема: <code className="text-sky-300">allocator&lt;std::byte&gt;::allocate</code> гарантирует
+              выравнивание только для <code className="text-sky-300">std::byte</code> (alignof = 1).
+              Нам нужно <code className="text-sky-300">alignof(pair_type)</code> и <code className="text-sky-300">alignof(uint32_t)</code>.
+            </p>
+            <CodeBlock
+              language="cpp"
+              code={`// Решение: align_block с нужным выравниванием
+static constexpr std::size_t required_alignment =
+    alignof(pair_type) > alignof(uint32_t)
+        ? alignof(pair_type) : alignof(uint32_t);
+
+struct alignas(required_alignment) align_block {
+    std::byte data[1];
+};
+
+// Ребаундим аллокатор к align_block
+using storage_alloc =
+    typename alloc_traits::template rebind_alloc<align_block>;
+
+// allocate/deallocate через storage_alloc_tr — выравнивание гарантировано`}
+            />
+            <p className="text-slate-300 text-sm mt-3 mb-2">
+              <strong className="text-white">std::launder</strong> используется для:
+            </p>
+            <ul className="text-slate-300 text-sm space-y-1 ml-4">
+              <li>• <code className="text-sky-300">index()</code> — доступ к массиву uint32_t через reinterpret_cast</li>
+              <li>• <code className="text-sky-300">emplace</code> catch-блок — <code className="text-sky-300">destroy(ka, std::launder(key_ptr))</code></li>
+            </ul>
+            <p className="text-slate-300 text-sm mt-2">
+              <strong className="text-white">Не используется</strong> для pair access:
+              Key и Value конструируются отдельно (не pair целиком), поэтому объект{' '}
+              <code className="text-sky-300">pair_type</code> формально не создан.
+              <code className="text-sky-300">reinterpret_cast</code> без launder — pragmatic approach,
+              работает на всех известных компиляторах.
+            </p>
           </div>
         </Section>
 
