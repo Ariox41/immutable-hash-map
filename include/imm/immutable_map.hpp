@@ -59,7 +59,7 @@ template <typename Key, typename Value, typename Hash, typename KeyEq,
           typename Alloc>
 class immutable_map_builder;
 
-template <typename Derived, typename Value, bool>
+template <typename Derived, typename Value, bool = std::is_copy_constructible_v<Value>>
 struct copy_support_base;
 
 // ============================================================================
@@ -290,7 +290,8 @@ protected:
         , index_size_(idx_sz)
     {}
 
-    friend class immutable_map_builder<Key, Value, Hash, KeyEq, Alloc>;
+    template <typename, typename, typename, typename, typename>
+    friend class immutable_map_builder;
     template <typename, typename, bool> friend struct copy_support_base;
 };
 
@@ -657,13 +658,6 @@ public:
                         std::forward_as_tuple((*first).first),
                         (*first).second);
         }
-    }
-
-    template <typename K, typename... ValueArgs>
-    void try_emplace(K&& key, ValueArgs&&... value_args) {
-        try_emplace(std::piecewise_construct,
-                    std::forward_as_tuple(std::forward<K>(key)),
-                    std::forward_as_tuple(std::forward<ValueArgs>(value_args)...));
     }
 
     size_type size() const noexcept { return size_; }
