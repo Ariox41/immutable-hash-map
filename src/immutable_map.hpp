@@ -1,7 +1,23 @@
 // immutable_map.hpp — C++17 immutable hash map
-// Keys are immutable after construction; values are mutable.
-// Single allocation for data + hash index via user-provided allocator.
-// Builder pattern: reserve → emplace → build.
+//
+// Design:
+//   - Keys immutable after construction, values mutable.
+//   - Single allocation: [ pair<const Key,Value>[N] ][ uint32_t[M] ]
+//   - Builder pattern: reserve → emplace → build.
+//   - Value need NOT be movable or copyable.
+//   - Copy ops enabled via CRTP base only when Value is copy-constructible.
+//   - Heterogeneous lookup: find() is templated on CompatibleKey.
+//     User provides Hash and Eq that work with both Key and CompatibleKey.
+//     E.g. Hash=hash<string_view>, Eq=equal_to<string_view> works for
+//     Key=string with find(string_view).
+//   - Open addressing, linear probing, load factor ≤ 0.5.
+//
+// Memory layout:
+//   [ std::pair<const Key, Value> [N] ]  [ padding ]  [ uint32_t [M] ]
+//   where M = next_power_of_2(2*N), load factor ≤ 0.5
+//
+// Hash index stores uint32_t offsets into the pairs array,
+// or UINT32_MAX for empty slots.
 
 #pragma once
 
@@ -15,7 +31,6 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -34,13 +49,13 @@ static constexpr std::uint32_t EMPTY_SLOT =
     std::numeric_limits<std::uint32_t>::max();
 
 template <typename T>
-struct is_tuple_impl : std::false_type {};
+struct is_pair_impl : std::false_type {};
 
-template <typename... Args>
-struct is_tuple_impl<std::tuple<Args...>> : std::true_type {};
+template <typename A, typename B>
+struct is_pair_impl<std::pair<A, B>> : std::true_type {};
 
 template <typename T>
-constexpr bool is_tuple_v = is_tuple_impl<std::decay_t<T>>::value;
+constexpr bool is_pair_v = is_pair_impl<std::decay_t<T>>::value;
 
 } // namespace detail
 
@@ -54,14 +69,241 @@ template <typename Key, typename Value, typename Hash, typename KeyEq,
 class immutable_map_builder;
 
 // ============================================================================
-// immutable_map
+// map_storage — owns the single allocation, layout computation, lifetime
 // ============================================================================
-// Memory layout (single allocation):
-//   [ Key[size_] ] [ padding ] [ Value[size_] ] [ padding ] [ uint32_t[index_size_] ]
-//
-// Hash table: open addressing, linear probing, load factor ≤ 0.5.
-// Index slots store uint32_t offsets into the key/value arrays,
-// or EMPTY_SLOT for vacant positions.
+// Shared between immutable_map and immutable_map_builder.
+// Contains: raw data pointer, element count, index size, allocator.
+// Does NOT contain capacity (that's builder-only).
+// ============================================================================
+
+template <typename Key,
+          typename Value,
+          typename Alloc = std::allocator<std::byte>>
+class map_storage {
+protected:
+    using pair_type     = std::pair<const Key, Value>;
+    using byte_type     = std::byte;
+    using byte_alloc    = typename std::allocator_traits<Alloc>::template
+                              rebind_alloc<byte_type>;
+    using byte_alloc_tr = std::allocator_traits<byte_alloc>;
+
+    static constexpr std::uint32_t EMPTY = detail::EMPTY_SLOT;
+
+    byte_type*  data_       = nullptr;
+    std::size_t size_       = 0;
+    std::size_t index_size_ = 0;
+    byte_alloc  alloc_;
+
+    // ----- layout computation (static, constexpr) -----
+    static constexpr std::size_t pairs_byte_size(std::size_t n) noexcept {
+        return n * sizeof(pair_type);
+    }
+
+    static constexpr std::size_t index_byte_offset(std::size_t n) noexcept {
+        return detail::align_up(pairs_byte_size(n), alignof(std::uint32_t));
+    }
+
+    static constexpr std::size_t total_bytes(std::size_t n,
+                                             std::size_t m) noexcept {
+        return index_byte_offset(n) + m * sizeof(std::uint32_t);
+    }
+
+    static constexpr std::size_t compute_index_size(std::size_t n) noexcept {
+        if (n == 0) return 0;
+        std::size_t m = 1;
+        while (m < 2 * n) m <<= 1;   // load factor ≤ 0.5
+        return m;
+    }
+
+    // ----- typed accessors -----
+    pair_type* pairs() noexcept {
+        return reinterpret_cast<pair_type*>(data_);
+    }
+    const pair_type* pairs() const noexcept {
+        return reinterpret_cast<const pair_type*>(data_);
+    }
+
+    std::uint32_t* index() noexcept {
+        return reinterpret_cast<std::uint32_t*>(
+            data_ + index_byte_offset(size_));
+    }
+    const std::uint32_t* index() const noexcept {
+        return reinterpret_cast<const std::uint32_t*>(
+            data_ + index_byte_offset(size_));
+    }
+
+    // ----- allocation / deallocation -----
+    void allocate(std::size_t n, std::size_t m) {
+        data_ = byte_alloc_tr::allocate(alloc_, total_bytes(n, m));
+    }
+
+    void deallocate() noexcept {
+        if (data_) {
+            byte_alloc_tr::deallocate(alloc_,
+                                      total_bytes(size_, index_size_));
+            data_ = nullptr;
+        }
+    }
+
+    // ----- element lifetime -----
+    void destroy_elements() noexcept {
+        pair_type* p = pairs();
+        for (std::size_t i = size_; i > 0; --i) {
+            p[i - 1].~pair_type();
+        }
+    }
+
+    void destroy_all() noexcept {
+        if (!data_) return;
+        destroy_elements();
+        deallocate();
+        size_       = 0;
+        index_size_ = 0;
+    }
+
+    // ----- index building -----
+    void build_index(Hash hash_fn) noexcept {
+        std::uint32_t* ix = index();
+        const std::size_t mask = index_size_ - 1;
+        for (std::size_t i = 0; i < index_size_; ++i)
+            ix[i] = EMPTY;
+
+        pair_type* p = pairs();
+        for (std::size_t i = 0; i < size_; ++i) {
+            std::size_t slot = hash_fn(p[i].first) & mask;
+            while (ix[slot] != EMPTY)
+                slot = (slot + 1) & mask;
+            ix[slot] = static_cast<std::uint32_t>(i);
+        }
+    }
+
+    // ----- lookup -----
+    template <typename CompatibleKey>
+    std::size_t find_slot(const CompatibleKey& key,
+                          Hash hash_fn, KeyEq eq_fn) const noexcept {
+        if (size_ == 0) return static_cast<std::size_t>(-1);
+        const std::uint32_t* ix = index();
+        const std::size_t mask = index_size_ - 1;
+        const pair_type* p = pairs();
+        std::size_t slot = hash_fn(key) & mask;
+        while (ix[slot] != EMPTY) {
+            const std::size_t idx = ix[slot];
+            if (eq_fn(p[idx].first, key))
+                return idx;
+            slot = (slot + 1) & mask;
+        }
+        return static_cast<std::size_t>(-1);
+    }
+
+    // ----- constructors -----
+    map_storage() noexcept = default;
+
+    explicit map_storage(const Alloc& alloc) noexcept
+        : alloc_(alloc)
+    {}
+
+    // Move
+    map_storage(map_storage&& other) noexcept
+        : data_(other.data_)
+        , size_(other.size_)
+        , index_size_(other.index_size_)
+        , alloc_(std::move(other.alloc_))
+    {
+        other.data_       = nullptr;
+        other.size_       = 0;
+        other.index_size_ = 0;
+    }
+
+    map_storage& operator=(map_storage&& other) noexcept {
+        if (this != &other) {
+            destroy_all();
+            data_       = other.data_;
+            size_       = other.size_;
+            index_size_ = other.index_size_;
+            alloc_      = std::move(other.alloc_);
+            other.data_       = nullptr;
+            other.size_       = 0;
+            other.index_size_ = 0;
+        }
+        return *this;
+    }
+
+    ~map_storage() { destroy_all(); }
+
+    // Adopt raw allocation (used by builder→map transfer)
+    struct adopt_tag {};
+
+    map_storage(adopt_tag, byte_type* data, std::size_t sz,
+                std::size_t idx_sz, byte_alloc a) noexcept
+        : data_(data)
+        , size_(sz)
+        , index_size_(idx_sz)
+        , alloc_(std::move(a))
+    {}
+
+    // Grant access to builder and copy_support_base
+    friend class immutable_map_builder<Key, Value, Hash, KeyEq, Alloc>;
+    template <typename, typename, bool> friend struct copy_support_base;
+};
+
+// ============================================================================
+// copy_support_base — CRTP base for conditional copy operations
+// ============================================================================
+// When Value is copy-constructible, provides copy ctor and copy assignment.
+// When not, copy ops are implicitly deleted (no overloads generated).
+// This avoids GCC8 issues with SFINAE on non-template operator=.
+// ============================================================================
+
+template <typename Derived, typename Value, bool = std::is_copy_constructible_v<Value>>
+struct copy_support_base {
+    // Value is NOT copy-constructible: copy ops are implicitly deleted.
+    // Nothing to do here.
+};
+
+template <typename Derived, typename Value>
+struct copy_support_base<Derived, Value, true> {
+protected:
+    // Called by Derived's copy constructor
+    void copy_from(const Derived& other) {
+        auto& self = static_cast<Derived&>(*this);
+        using storage_t = map_storage<typename Derived::key_type,
+                                      typename Derived::mapped_type,
+                                      typename Derived::allocator_type>;
+        if (other.size() > 0) {
+            const std::size_t n = other.size();
+            const std::size_t m = storage_t::compute_index_size(n);
+            self.allocate(n, m);
+            self.size_       = n;
+            self.index_size_ = m;
+
+            // Copy pairs
+            auto* dst = self.pairs();
+            const auto* src = other.pairs();
+            for (std::size_t i = 0; i < n; ++i) {
+                ::new (static_cast<void*>(dst + i))
+                    std::pair<const typename Derived::key_type,
+                              typename Derived::mapped_type>(
+                        src[i].first, src[i].second);
+            }
+            // Copy index
+            std::memcpy(self.index(), other.index(),
+                        m * sizeof(std::uint32_t));
+        }
+    }
+
+public:
+    Derived& copy_assign(Derived& self, const Derived& other) {
+        if (&self != &other) {
+            self.destroy_all();
+            self.alloc_ = other.alloc_;
+            copy_from(other);
+        }
+        return self;
+    }
+};
+
+// ============================================================================
+// immutable_map
 // ============================================================================
 
 template <typename Key,
@@ -69,135 +311,33 @@ template <typename Key,
           typename Hash   = std::hash<Key>,
           typename KeyEq  = std::equal_to<Key>,
           typename Alloc  = std::allocator<std::byte>>
-class immutable_map {
+class immutable_map
+    : private map_storage<Key, Value, Alloc>,
+      private copy_support_base<
+          immutable_map<Key, Value, Hash, KeyEq, Alloc>, Value>
+{
+    using storage_t = map_storage<Key, Value, Alloc>;
+    using copy_base_t = copy_support_base<immutable_map, Value>;
+    friend copy_base_t;
+
 public:
     // ----- type aliases -----
     using key_type        = Key;
     using mapped_type     = Value;
+    using value_type      = std::pair<const Key, Value>;
     using size_type       = std::size_t;
     using difference_type = std::ptrdiff_t;
     using hasher          = Hash;
     using key_equal       = KeyEq;
     using allocator_type  = Alloc;
+    using reference       = value_type&;
+    using const_reference = const value_type&;
 
 private:
-    using byte_type       = std::byte;
-    using byte_alloc      = typename std::allocator_traits<Alloc>::template
-                                rebind_alloc<byte_type>;
-    using byte_alloc_tr   = std::allocator_traits<byte_alloc>;
-
-    static constexpr std::uint32_t EMPTY = detail::EMPTY_SLOT;
-
-    // ----- data members -----
-    byte_type*  data_      = nullptr;
-    size_type   size_      = 0;
-    size_type   index_size_= 0;   // always a power of two (or 0)
-    size_type   mask_      = 0;   // index_size_ - 1
-    byte_alloc  alloc_;
-
-    // ----- layout helpers (static, constexpr) -----
-    static constexpr size_type keys_offset() noexcept { return 0; }
-
-    static constexpr size_type values_offset(size_type n) noexcept {
-        return detail::align_up(n * sizeof(Key), alignof(Value));
-    }
-
-    static constexpr size_type index_offset(size_type n) noexcept {
-        return detail::align_up(values_offset(n) + n * sizeof(Value),
-                                alignof(std::uint32_t));
-    }
-
-    static constexpr size_type total_bytes(size_type n, size_type m) noexcept {
-        return index_offset(n) + m * sizeof(std::uint32_t);
-    }
-
-    static constexpr size_type compute_index_size(size_type n) noexcept {
-        if (n == 0) return 0;
-        size_type m = 1;
-        while (m < 2 * n) m <<= 1;   // load factor ≤ 0.5
-        return m;
-    }
-
-    // ----- typed pointer accessors -----
-    Key* keys() noexcept {
-        return reinterpret_cast<Key*>(data_ + keys_offset());
-    }
-    const Key* keys() const noexcept {
-        return reinterpret_cast<const Key*>(data_ + keys_offset());
-    }
-
-    Value* vals() noexcept {
-        return reinterpret_cast<Value*>(data_ + values_offset(size_));
-    }
-    const Value* vals() const noexcept {
-        return reinterpret_cast<const Value*>(data_ + values_offset(size_));
-    }
-
-    std::uint32_t* idx() noexcept {
-        return reinterpret_cast<std::uint32_t*>(data_ + index_offset(size_));
-    }
-    const std::uint32_t* idx() const noexcept {
-        return reinterpret_cast<const std::uint32_t*>(data_ + index_offset(size_));
-    }
-
-    // ----- internal helpers -----
-    void destroy_contents() noexcept {
-        if (!data_) return;
-        // Destroy in reverse order
-        for (size_type i = size_; i > 0; --i) {
-            vals()[i - 1].~Value();
-            keys()[i - 1].~Key();
-        }
-        byte_alloc_tr::deallocate(alloc_, data_,
-                                  total_bytes(size_, index_size_));
-        data_       = nullptr;
-        size_       = 0;
-        index_size_ = 0;
-        mask_       = 0;
-    }
-
-    void build_index() noexcept {
-        std::uint32_t* ix = idx();
-        for (size_type i = 0; i < index_size_; ++i)
-            ix[i] = EMPTY;
-
-        Hash hash_fn;
-        for (size_type i = 0; i < size_; ++i) {
-            size_type slot = hash_fn(keys()[i]) & mask_;
-            while (ix[slot] != EMPTY)
-                slot = (slot + 1) & mask_;
-            ix[slot] = static_cast<std::uint32_t>(i);
-        }
-    }
-
-    size_type find_slot(const Key& key) const noexcept {
-        if (size_ == 0) return static_cast<size_type>(-1);
-        const std::uint32_t* ix = idx();
-        Hash    hash_fn;
-        KeyEq   eq_fn;
-        size_type slot = hash_fn(key) & mask_;
-        while (ix[slot] != EMPTY) {
-            if (eq_fn(keys()[ix[slot]], key))
-                return ix[slot];
-            slot = (slot + 1) & mask_;
-        }
-        return static_cast<size_type>(-1);
-    }
-
-    // ----- adopted constructor (used by builder) -----
-    struct adopt_tag {};
-
-    immutable_map(adopt_tag, byte_type* data, size_type sz,
-                  size_type idx_sz, byte_alloc a) noexcept
-        : data_(data)
-        , size_(sz)
-        , index_size_(idx_sz)
-        , mask_(idx_sz > 0 ? idx_sz - 1 : 0)
-        , alloc_(std::move(a))
-    {}
-
-    // Grant builder access to private constructor and layout helpers
-    friend class immutable_map_builder<Key, Value, Hash, KeyEq, Alloc>;
+    using typename storage_t::byte_type;
+    using typename storage_t::byte_alloc;
+    using typename storage_t::byte_alloc_tr;
+    using typename storage_t::pair_type;
 
 public:
     // ========================================================================
@@ -206,196 +346,113 @@ public:
 
     immutable_map() noexcept = default;
 
-    // Move
+    // Move (inherited from storage, but we expose it explicitly)
     immutable_map(immutable_map&& other) noexcept
-        : data_(other.data_)
-        , size_(other.size_)
-        , index_size_(other.index_size_)
-        , mask_(other.mask_)
-        , alloc_(std::move(other.alloc_))
-    {
-        other.data_       = nullptr;
-        other.size_       = 0;
-        other.index_size_ = 0;
-        other.mask_       = 0;
-    }
+        : storage_t(std::move(other))
+    {}
 
     immutable_map& operator=(immutable_map&& other) noexcept {
-        if (this != &other) {
-            destroy_contents();
-            data_       = other.data_;
-            size_       = other.size_;
-            index_size_ = other.index_size_;
-            mask_       = other.mask_;
-            alloc_      = std::move(other.alloc_);
-            other.data_       = nullptr;
-            other.size_       = 0;
-            other.index_size_ = 0;
-            other.mask_       = 0;
-        }
+        storage_t::operator=(std::move(other));
         return *this;
     }
 
-    // Copy — enabled only when Value is copy-constructible
-    template <typename V = Value,
-              std::enable_if_t<std::is_copy_constructible_v<V>, int> = 0>
+    // Copy — only available when Value is copy-constructible
+    // (enabled by copy_support_base)
     immutable_map(const immutable_map& other)
-        : alloc_(other.alloc_)
+        : storage_t(other.alloc_)
     {
-        if (other.size_ > 0) {
-            const size_type n = other.size_;
-            const size_type m = other.index_size_;
-            data_ = byte_alloc_tr::allocate(alloc_, total_bytes(n, m));
-            size_       = n;
-            index_size_ = m;
-            mask_       = m - 1;
-
-            for (size_type i = 0; i < n; ++i) {
-                ::new (static_cast<void*>(keys() + i))
-                    Key(other.keys()[i]);
-                ::new (static_cast<void*>(vals() + i))
-                    Value(other.vals()[i]);
-            }
-            std::memcpy(idx(), other.idx(), m * sizeof(std::uint32_t));
-        }
+        copy_base_t::copy_from(other);
     }
 
-    template <typename V = Value,
-              std::enable_if_t<std::is_copy_constructible_v<V>, int> = 0>
     immutable_map& operator=(const immutable_map& other) {
-        if (this != &other) {
-            destroy_contents();
-            alloc_ = other.alloc_;
-            if (other.size_ > 0) {
-                const size_type n = other.size_;
-                const size_type m = other.index_size_;
-                data_ = byte_alloc_tr::allocate(alloc_, total_bytes(n, m));
-                size_       = n;
-                index_size_ = m;
-                mask_       = m - 1;
-
-                for (size_type i = 0; i < n; ++i) {
-                    ::new (static_cast<void*>(keys() + i))
-                        Key(other.keys()[i]);
-                    ::new (static_cast<void*>(vals() + i))
-                        Value(other.vals()[i]);
-                }
-                std::memcpy(idx(), other.idx(),
-                            m * sizeof(std::uint32_t));
-            }
-        }
-        return *this;
+        return copy_base_t::copy_assign(*this, other);
     }
 
-    ~immutable_map() { destroy_contents(); }
+    ~immutable_map() = default;  // storage handles cleanup
 
     // ========================================================================
     // Capacity
     // ========================================================================
 
-    size_type size()  const noexcept { return size_; }
-    bool      empty() const noexcept { return size_ == 0; }
+    size_type size()  const noexcept { return storage_t::size_; }
+    bool      empty() const noexcept { return storage_t::size_ == 0; }
 
     // ========================================================================
-    // Lookup
+    // Lookup — heterogeneous: accepts any CompatibleKey
+    // ========================================================================
+    // User must ensure Hash and KeyEq work with CompatibleKey.
+    // E.g. Key=string, Hash=hash<string_view>, KeyEq=equal_to<string_view>
+    // allows find(string_view) without constructing a string.
     // ========================================================================
 
-    /// Returns pointer to value, or nullptr if not found.
-    Value* find(const Key& key) noexcept {
-        size_type s = find_slot(key);
-        return s == static_cast<size_type>(-1) ? nullptr : &vals()[s];
+    template <typename CompatibleKey>
+    value_type* find(const CompatibleKey& key) noexcept {
+        size_type s = storage_t::find_slot(key, Hash{}, KeyEq{});
+        return s == static_cast<size_type>(-1)
+            ? nullptr
+            : &storage_t::pairs()[s];
     }
 
-    const Value* find(const Key& key) const noexcept {
-        size_type s = find_slot(key);
-        return s == static_cast<size_type>(-1) ? nullptr : &vals()[s];
+    template <typename CompatibleKey>
+    const value_type* find(const CompatibleKey& key) const noexcept {
+        size_type s = storage_t::find_slot(key, Hash{}, KeyEq{});
+        return s == static_cast<size_type>(-1)
+            ? nullptr
+            : &storage_t::pairs()[s];
     }
 
-    /// Returns reference to value; throws std::out_of_range if not found.
-    Value& at(const Key& key) {
-        Value* p = find(key);
+    template <typename CompatibleKey>
+    Value& at(const CompatibleKey& key) {
+        value_type* p = find(key);
         if (!p) throw std::out_of_range("immutable_map::at: key not found");
-        return *p;
+        return p->second;
     }
 
-    const Value& at(const Key& key) const {
-        const Value* p = find(key);
+    template <typename CompatibleKey>
+    const Value& at(const CompatibleKey& key) const {
+        const value_type* p = find(key);
         if (!p) throw std::out_of_range("immutable_map::at: key not found");
-        return *p;
+        return p->second;
     }
 
-    /// Returns true if key is present.
-    bool contains(const Key& key) const noexcept {
-        return find_slot(key) != static_cast<size_type>(-1);
+    template <typename CompatibleKey>
+    bool contains(const CompatibleKey& key) const noexcept {
+        return storage_t::find_slot(key, Hash{}, KeyEq{})
+               != static_cast<size_type>(-1);
     }
 
     // ========================================================================
-    // Iterators
-    // ========================================================================
-    // Proxy reference: { const Key& key, Value& value }
-    // Supports structured bindings and range-for.
+    // Iterators — LegacyForwardIterator over value_type&
     // ========================================================================
 
     template <bool IsConst>
     class basic_iterator {
         friend class immutable_map;
 
-        using map_ptr = std::conditional_t<IsConst,
-                                           const immutable_map*,
-                                           immutable_map*>;
-        map_ptr   map_;
-        size_type pos_;
+        using ptr = std::conditional_t<IsConst, const value_type*, value_type*>;
+        ptr     p_;
+        size_type pos_;  // for operator- between iterators
 
-        basic_iterator(map_ptr m, size_type p) noexcept
-            : map_(m), pos_(p) {}
+        basic_iterator(ptr p, size_type pos) noexcept
+            : p_(p), pos_(pos) {}
 
     public:
         using iterator_category = std::forward_iterator_tag;
+        using value_type        = immutable_map::value_type;
         using difference_type   = std::ptrdiff_t;
+        using reference         = std::conditional_t<IsConst,
+                                                     const value_type&,
+                                                     value_type&>;
+        using pointer           = std::conditional_t<IsConst,
+                                                     const value_type*,
+                                                     value_type*>;
 
-        struct reference {
-            const Key& key;
-            std::conditional_t<IsConst, const Value&, Value&> value;
-        };
+        reference operator*() const noexcept { return *p_; }
+        pointer   operator->() const noexcept { return p_; }
 
-        using value_type = reference;
-        using pointer    = void;
-
-        reference operator*() const noexcept {
-            return { map_->keys()[pos_], map_->vals()[pos_] };
-        }
-
-        basic_iterator& operator++() noexcept { ++pos_; return *this; }
+        basic_iterator& operator++() noexcept { ++p_; ++pos_; return *this; }
         basic_iterator  operator++(int) noexcept {
-            auto tmp = *this; ++pos_; return tmp;
-        }
-
-        basic_iterator& operator--() noexcept { --pos_; return *this; }
-        basic_iterator  operator--(int) noexcept {
-            auto tmp = *this; --pos_; return tmp;
-        }
-
-        basic_iterator& operator+=(difference_type n) noexcept {
-            pos_ = static_cast<size_type>(
-                static_cast<difference_type>(pos_) + n);
-            return *this;
-        }
-
-        basic_iterator operator+(difference_type n) const noexcept {
-            auto tmp = *this; tmp += n; return tmp;
-        }
-
-        basic_iterator operator-(difference_type n) const noexcept {
-            auto tmp = *this; tmp -= n; return tmp;
-        }
-
-        difference_type operator-(const basic_iterator& o) const noexcept {
-            return static_cast<difference_type>(pos_) -
-                   static_cast<difference_type>(o.pos_);
-        }
-
-        reference operator[](difference_type n) const noexcept {
-            return *(*this + n);
+            auto tmp = *this; ++p_; ++pos_; return tmp;
         }
 
         bool operator==(const basic_iterator& o) const noexcept {
@@ -404,57 +461,27 @@ public:
         bool operator!=(const basic_iterator& o) const noexcept {
             return pos_ != o.pos_;
         }
-        bool operator<(const basic_iterator& o) const noexcept {
-            return pos_ < o.pos_;
-        }
-        bool operator<=(const basic_iterator& o) const noexcept {
-            return pos_ <= o.pos_;
-        }
-        bool operator>(const basic_iterator& o) const noexcept {
-            return pos_ > o.pos_;
-        }
-        bool operator>=(const basic_iterator& o) const noexcept {
-            return pos_ >= o.pos_;
-        }
 
-        // Allow conversion from iterator to const_iterator
+        // Allow conversion iterator → const_iterator
         template <bool Other,
                   std::enable_if_t<IsConst && !Other, int> = 0>
         basic_iterator(const basic_iterator<Other>& o) noexcept
-            : map_(o.map_), pos_(o.pos_) {}
+            : p_(o.p_), pos_(o.pos_) {}
     };
 
     using iterator       = basic_iterator<false>;
     using const_iterator = basic_iterator<true>;
 
-    iterator       begin()        noexcept { return iterator(this, 0); }
-    iterator       end()          noexcept { return iterator(this, size_); }
-    const_iterator begin()  const noexcept { return const_iterator(this, 0); }
-    const_iterator end()    const noexcept { return const_iterator(this, size_); }
-    const_iterator cbegin() const noexcept { return const_iterator(this, 0); }
-    const_iterator cend()   const noexcept { return const_iterator(this, size_); }
-
-    // ========================================================================
-    // Direct data access (for advanced use)
-    // ========================================================================
-
-    const Key*   data_keys()   const noexcept { return keys(); }
-    Value*       data_values() noexcept       { return vals(); }
-    const Value* data_values() const noexcept { return vals(); }
+    iterator       begin()        noexcept { return iterator(storage_t::pairs(), 0); }
+    iterator       end()          noexcept { return iterator(storage_t::pairs() + storage_t::size_, storage_t::size_); }
+    const_iterator begin()  const noexcept { return const_iterator(storage_t::pairs(), 0); }
+    const_iterator end()    const noexcept { return const_iterator(storage_t::pairs() + storage_t::size_, storage_t::size_); }
+    const_iterator cbegin() const noexcept { return const_iterator(storage_t::pairs(), 0); }
+    const_iterator cend()   const noexcept { return const_iterator(storage_t::pairs() + storage_t::size_, storage_t::size_); }
 };
 
 // ============================================================================
 // immutable_map_builder
-// ============================================================================
-// Usage:
-//   immutable_map_builder<K,V> b;
-//   b.reserve(n);
-//   b.emplace(key1, arg1, arg2, ...);
-//   b.emplace(key2, ...);
-//   auto m = b.build();
-//
-// Memory is allocated once in reserve(). Objects are constructed in-place.
-// Index is built in build(). Ownership is transferred to immutable_map.
 // ============================================================================
 
 template <typename Key,
@@ -465,73 +492,26 @@ template <typename Key,
 class immutable_map_builder {
 public:
     using map_type    = immutable_map<Key, Value, Hash, KeyEq, Alloc>;
+    using value_type  = std::pair<const Key, Value>;
     using size_type   = std::size_t;
 
 private:
-    using byte_type     = std::byte;
-    using byte_alloc    = typename std::allocator_traits<Alloc>::template
-                              rebind_alloc<byte_type>;
-    using byte_alloc_tr = std::allocator_traits<byte_alloc>;
+    using storage_t   = map_storage<Key, Value, Alloc>;
+    using byte_type   = std::byte;
+    using byte_alloc  = typename storage_t::byte_alloc;
+    using byte_alloc_tr = typename storage_t::byte_alloc_tr;
 
-    byte_type*  data_       = nullptr;
-    size_type   capacity_   = 0;
-    size_type   size_       = 0;
-    size_type   index_size_ = 0;
-    byte_alloc  alloc_;
+    storage_t   storage_;
+    size_type   capacity_ = 0;
+    size_type   size_     = 0;
 
-    // Layout helpers (duplicated from immutable_map for constexpr access)
-    static constexpr size_type keys_offset() noexcept { return 0; }
-
-    static constexpr size_type values_offset(size_type n) noexcept {
-        return detail::align_up(n * sizeof(Key), alignof(Value));
-    }
-
-    static constexpr size_type index_offset(size_type n) noexcept {
-        return detail::align_up(values_offset(n) + n * sizeof(Value),
-                                alignof(std::uint32_t));
-    }
-
-    static constexpr size_type total_bytes(size_type n, size_type m) noexcept {
-        return index_offset(n) + m * sizeof(std::uint32_t);
-    }
-
-    static constexpr size_type compute_index_size(size_type n) noexcept {
-        if (n == 0) return 0;
-        size_type m = 1;
-        while (m < 2 * n) m <<= 1;
-        return m;
-    }
-
-    Key* keys() noexcept {
-        return reinterpret_cast<Key*>(data_ + keys_offset());
-    }
-    Value* vals() noexcept {
-        return reinterpret_cast<Value*>(data_ + values_offset(capacity_));
-    }
-    std::uint32_t* idx() noexcept {
-        return reinterpret_cast<std::uint32_t*>(
-            data_ + index_offset(capacity_));
-    }
-
-    void destroy_contents() noexcept {
-        if (!data_) return;
-        for (size_type i = size_; i > 0; --i) {
-            vals()[i - 1].~Value();
-            keys()[i - 1].~Key();
-        }
-        byte_alloc_tr::deallocate(alloc_,
-                                  total_bytes(capacity_, index_size_));
-        data_       = nullptr;
-        capacity_   = 0;
-        size_       = 0;
-        index_size_ = 0;
-    }
+    value_type* pairs() noexcept { return storage_.pairs(); }
 
 public:
     immutable_map_builder() noexcept = default;
 
     explicit immutable_map_builder(const Alloc& alloc) noexcept
-        : alloc_(alloc)
+        : storage_(alloc)
     {}
 
     // Non-copyable
@@ -540,47 +520,39 @@ public:
 
     // Movable
     immutable_map_builder(immutable_map_builder&& other) noexcept
-        : data_(other.data_)
+        : storage_(std::move(other.storage_))
         , capacity_(other.capacity_)
         , size_(other.size_)
-        , index_size_(other.index_size_)
-        , alloc_(std::move(other.alloc_))
     {
-        other.data_       = nullptr;
-        other.capacity_   = 0;
-        other.size_       = 0;
-        other.index_size_ = 0;
+        other.capacity_ = 0;
+        other.size_     = 0;
     }
 
     immutable_map_builder& operator=(immutable_map_builder&& other) noexcept {
         if (this != &other) {
-            destroy_contents();
-            data_       = other.data_;
-            capacity_   = other.capacity_;
-            size_       = other.size_;
-            index_size_ = other.index_size_;
-            alloc_      = std::move(other.alloc_);
-            other.data_       = nullptr;
-            other.capacity_   = 0;
-            other.size_       = 0;
-            other.index_size_ = 0;
+            storage_.destroy_all();
+            storage_  = std::move(other.storage_);
+            capacity_ = other.capacity_;
+            size_     = other.size_;
+            other.capacity_ = 0;
+            other.size_     = 0;
         }
         return *this;
     }
 
-    ~immutable_map_builder() { destroy_contents(); }
+    ~immutable_map_builder() = default;
 
     /// Reserve space for n elements. Allocates the final memory block.
-    /// Must be called before any emplace(). Calling more than once is UB.
+    /// Must be called exactly once, before any emplace().
     void reserve(size_type n) {
-        if (data_) {
+        if (storage_.data_) {
             throw std::logic_error(
                 "immutable_map_builder::reserve called after allocation");
         }
-        capacity_   = n;
-        index_size_ = compute_index_size(n);
+        capacity_ = n;
+        storage_.index_size_ = storage_t::compute_index_size(n);
         if (n == 0) return;
-        data_ = byte_alloc_tr::allocate(alloc_, total_bytes(n, index_size_));
+        storage_.allocate(n, storage_.index_size_);
     }
 
     /// Construct a key-value pair in-place.
@@ -593,10 +565,10 @@ public:
                 "immutable_map_builder::emplace: capacity exceeded, "
                 "call reserve() first");
         }
-        ::new (static_cast<void*>(keys() + size_))
-            Key(std::forward<K>(key));
-        ::new (static_cast<void*>(vals() + size_))
-            Value(std::forward<Args>(args)...);
+        ::new (static_cast<void*>(pairs() + size_))
+            value_type(std::piecewise_construct,
+                       std::forward_as_tuple(std::forward<K>(key)),
+                       std::forward_as_tuple(std::forward<Args>(args)...));
         ++size_;
     }
 
@@ -606,33 +578,26 @@ public:
     /// Finalize: build hash index and transfer ownership to immutable_map.
     /// After build(), this builder is empty.
     map_type build() {
-        if (!data_ && capacity_ > 0) {
+        if (!storage_.data_ && capacity_ > 0) {
             throw std::logic_error(
                 "immutable_map_builder::build: reserve() was not called");
         }
 
         // Build hash index
+        storage_.size_ = size_;
         if (size_ > 0) {
-            std::uint32_t* ix = idx();
-            for (size_type i = 0; i < index_size_; ++i)
-                ix[i] = detail::EMPTY_SLOT;
-
-            Hash hash_fn;
-            for (size_type i = 0; i < size_; ++i) {
-                size_type slot = hash_fn(keys()[i]) & (index_size_ - 1);
-                while (ix[slot] != detail::EMPTY_SLOT)
-                    slot = (slot + 1) & (index_size_ - 1);
-                ix[slot] = static_cast<std::uint32_t>(i);
-            }
+            storage_.build_index(Hash{});
         }
 
-        // Transfer ownership
-        map_type result(typename map_type::adopt_tag{},
-                        data_, size_, index_size_, std::move(alloc_));
-        data_       = nullptr;
-        size_       = 0;
-        capacity_   = 0;
-        index_size_ = 0;
+        // Transfer ownership to immutable_map
+        map_type result(typename storage_t::adopt_tag{},
+                        storage_.data_, size_, storage_.index_size_,
+                        std::move(storage_.alloc_));
+        storage_.data_       = nullptr;
+        storage_.size_       = 0;
+        storage_.index_size_ = 0;
+        capacity_ = 0;
+        size_     = 0;
         return result;
     }
 };
@@ -645,7 +610,21 @@ public:
 //             (Value is constructed from unpacked tuple)
 // ============================================================================
 
+namespace detail {
+
+template <typename T>
+struct is_tuple_impl : std::false_type {};
+
+template <typename... Args>
+struct is_tuple_impl<std::tuple<Args...>> : std::true_type {};
+
+template <typename T>
+constexpr bool is_tuple_v = is_tuple_impl<std::decay_t<T>>::value;
+
+} // namespace detail
+
 /// Collect from range of {key, value} pairs.
+/// If .second is a tuple, Value is constructed from unpacked tuple elements.
 template <typename Key, typename Value,
           typename Hash  = std::hash<Key>,
           typename KeyEq = std::equal_to<Key>,
@@ -653,7 +632,7 @@ template <typename Key, typename Value,
           typename ForwardIt>
 immutable_map<Key, Value, Hash, KeyEq, Alloc>
 collect(ForwardIt first, ForwardIt last) {
-    using ref_t = decltype(*first);
+    using ref_t    = decltype(*first);
     using second_t = std::decay_t<decltype(std::declval<ref_t>().second)>;
 
     const auto n = static_cast<std::size_t>(std::distance(first, last));
@@ -661,7 +640,6 @@ collect(ForwardIt first, ForwardIt last) {
     builder.reserve(n);
 
     if constexpr (detail::is_tuple_v<second_t>) {
-        // second is a tuple → unpack into Value constructor
         for (; first != last; ++first) {
             std::apply(
                 [&](auto&&... args) {
@@ -671,7 +649,6 @@ collect(ForwardIt first, ForwardIt last) {
                 (*first).second);
         }
     } else {
-        // second is directly a Value
         for (; first != last; ++first) {
             builder.emplace(Key((*first).first), (*first).second);
         }
@@ -695,7 +672,7 @@ auto collect(const Range& range)
 }
 
 /// Collect from range of {key, tuple<Args...>} pairs.
-/// Value is constructed via std::apply from the tuple.
+/// Value is always constructed via std::apply from the tuple.
 template <typename Key, typename Value,
           typename Hash  = std::hash<Key>,
           typename KeyEq = std::equal_to<Key>,
