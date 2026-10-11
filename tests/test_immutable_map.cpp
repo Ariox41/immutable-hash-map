@@ -100,12 +100,12 @@ TEST(find_and_contains) {
     ASSERT(m.contains("world"));
     ASSERT(!m.contains("missing"));
 
-    auto* p = m.find("hello");
-    ASSERT(p != nullptr);
+    auto p = m.find("hello");
+    ASSERT(p != m.end());
     ASSERT(p->second == 42);
 
-    auto* q = m.find("missing");
-    ASSERT(q == nullptr);
+    auto q = m.find("missing");
+    ASSERT(q == m.end());
 }
 
 TEST(heterogeneous_lookup) {
@@ -120,8 +120,8 @@ TEST(heterogeneous_lookup) {
     ASSERT(m.contains(sv));
     ASSERT(m.at(sv) == 1);
 
-    auto* p = m.find(std::string_view("world"));
-    ASSERT(p != nullptr);
+    auto p = m.find(std::string_view("world"));
+    ASSERT(p != m.end());
     ASSERT(p->second == 2);
 
     // const char* also works
@@ -207,7 +207,7 @@ TEST(empty_map) {
     imm::immutable_map<int, int> m;
     ASSERT(m.empty());
     ASSERT(m.size() == 0);
-    ASSERT(m.find(42) == nullptr);
+    ASSERT(m.find(42) == m.end());
     ASSERT(!m.contains(42));
     ASSERT(m.begin() == m.end());
 }

@@ -400,8 +400,11 @@ imm::immutable_map<std::string, int, string_hash, string_eq> map;
 
 // Lookup by string_view — no temporary string!
 std::string_view key = "hello";
-auto* val = map.find(key);         // OK
-int x = map.at(key);               // OK
+auto val = map.find(key);          // Returns iterator
+if (val != map.end()) {            // Check if found
+    int x = val->second;           // OK
+}
+int y = map.at(key);               // OK, throws if not found
 bool has = map.contains(key);      // OK
 
 // Also works with const char*:
@@ -476,7 +479,7 @@ assert(m2.at("origin").x == 0);`}
             <Param name="size()" type="→ size_type" desc="noexcept" />
             <Param name="empty()" type="→ bool" desc="noexcept" />
             <Param name="get_allocator()" type="→ allocator_type" desc="noexcept" />
-            <Param name="find(key)" type="→ pair*" desc="template<CompatibleKey>. Conditional noexcept." />
+            <Param name="find(key)" type="→ iterator" desc="template<CompatibleKey>. Returns end() if not found. Conditional noexcept." />
             <Param name="at(key)" type="→ Value&" desc="template<CompatibleKey>. Throws out_of_range." />
             <Param name="contains(key)" type="→ bool" desc="template<CompatibleKey>. Conditional noexcept." />
             <Param name="begin()/end()" type="→ iterator" desc="Forward iterator, returns pair&" />

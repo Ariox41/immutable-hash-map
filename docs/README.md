@@ -72,9 +72,12 @@ imm::immutable_map<std::string, int, string_hash, string_eq> map;
 
 // Lookup by string_view — no temporary string!
 std::string_view key = "hello";
-map.find(key);      // OK
-map.at(key);        // OK
-map.contains(key);  // OK
+auto it = map.find(key);  // Returns iterator
+if (it != map.end()) {    // Check if found
+    int x = it->second;   // OK
+}
+int y = map.at(key);      // OK, throws if not found
+map.contains(key);        // OK
 ```
 
 ## Non-Movable Values

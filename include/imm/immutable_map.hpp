@@ -361,7 +361,6 @@ class immutable_map
       private copy_support_base<
           immutable_map<Key, Value, Hash, KeyEq, Alloc>, Value>
 {
-    using storage_t   = map_storage<Key, Value, Alloc>;
     using copy_base_t = copy_support_base<immutable_map, Value>;
     friend copy_base_t;
 
@@ -414,41 +413,41 @@ public:
     }
 
     template <typename CompatibleKey>
-    value_type* find(const CompatibleKey& key)
+    iterator find(const CompatibleKey& key)
         noexcept(noexcept(Hash{}(key)) && noexcept(KeyEq{}(key, key)))
     {
         Hash hash_fn;
         KeyEq eq_fn;
         size_type s = storage_t::find_slot(key, hash_fn, eq_fn);
         return s == static_cast<size_type>(-1)
-            ? nullptr
+            ? end()
             : storage_t::pair_at(s);
     }
 
     template <typename CompatibleKey>
-    const value_type* find(const CompatibleKey& key) const
+    const_iterator find(const CompatibleKey& key) const
         noexcept(noexcept(Hash{}(key)) && noexcept(KeyEq{}(key, key)))
     {
         Hash hash_fn;
         KeyEq eq_fn;
         size_type s = storage_t::find_slot(key, hash_fn, eq_fn);
         return s == static_cast<size_type>(-1)
-            ? nullptr
+            ? end()
             : storage_t::pair_at(s);
     }
 
     template <typename CompatibleKey>
     Value& at(const CompatibleKey& key) {
-        value_type* p = find(key);
-        if (!p) throw std::out_of_range("immutable_map::at: key not found");
-        return p->second;
+        iterator it = find(key);
+        if (it == end()) throw std::out_of_range("immutable_map::at: key not found");
+        return it->second;
     }
 
     template <typename CompatibleKey>
     const Value& at(const CompatibleKey& key) const {
-        const value_type* p = find(key);
-        if (!p) throw std::out_of_range("immutable_map::at: key not found");
-        return p->second;
+        const_iterator it = find(key);
+        if (it == end()) throw std::out_of_range("immutable_map::at: key not found");
+        return it->second;
     }
 
     template <typename CompatibleKey>
@@ -461,58 +460,16 @@ public:
                != static_cast<size_type>(-1);
     }
 
-    template <bool IsConst>
-    class basic_iterator {
-        friend class immutable_map;
+    // Iterators are raw pointers - value_type* is a valid forward iterator
+    using iterator       = value_type*;
+    using const_iterator = const value_type*;
 
-        using ptr = std::conditional_t<IsConst, const value_type*, value_type*>;
-        ptr       p_;
-        size_type pos_;
-
-        basic_iterator(ptr p, size_type pos) noexcept
-            : p_(p), pos_(pos) {}
-
-    public:
-        using iterator_category = std::forward_iterator_tag;
-        using value_type        = immutable_map::value_type;
-        using difference_type   = std::ptrdiff_t;
-        using reference         = std::conditional_t<IsConst,
-                                                     const value_type&,
-                                                     value_type&>;
-        using pointer           = std::conditional_t<IsConst,
-                                                     const value_type*,
-                                                     value_type*>;
-
-        reference operator*()  const noexcept { return *p_; }
-        pointer   operator->() const noexcept { return p_; }
-
-        basic_iterator& operator++() noexcept { ++p_; ++pos_; return *this; }
-        basic_iterator  operator++(int) noexcept {
-            auto tmp = *this; ++p_; ++pos_; return tmp;
-        }
-
-        bool operator==(const basic_iterator& o) const noexcept {
-            return pos_ == o.pos_;
-        }
-        bool operator!=(const basic_iterator& o) const noexcept {
-            return pos_ != o.pos_;
-        }
-
-        template <bool Other,
-                  std::enable_if_t<IsConst && !Other, int> = 0>
-        basic_iterator(const basic_iterator<Other>& o) noexcept
-            : p_(o.p_), pos_(o.pos_) {}
-    };
-
-    using iterator       = basic_iterator<false>;
-    using const_iterator = basic_iterator<true>;
-
-    iterator       begin()        noexcept { return iterator(storage_t::pairs(), 0); }
-    iterator       end()          noexcept { return iterator(storage_t::end_ptr(), storage_t::size_); }
-    const_iterator begin()  const noexcept { return const_iterator(storage_t::pairs(), 0); }
-    const_iterator end()    const noexcept { return const_iterator(storage_t::end_ptr(), storage_t::size_); }
-    const_iterator cbegin() const noexcept { return const_iterator(storage_t::pairs(), 0); }
-    const_iterator cend()   const noexcept { return const_iterator(storage_t::end_ptr(), storage_t::size_); }
+    iterator       begin()        noexcept { return storage_t::pairs(); }
+    iterator       end()          noexcept { return storage_t::end_ptr(); }
+    const_iterator begin()  const noexcept { return storage_t::pairs(); }
+    const_iterator end()    const noexcept { return storage_t::end_ptr(); }
+    const_iterator cbegin() const noexcept { return storage_t::pairs(); }
+    const_iterator cend()   const noexcept { return storage_t::end_ptr(); }
 };
 
 // ============================================================================
