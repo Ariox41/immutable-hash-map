@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Highlight, themes } from 'prism-react-renderer';
-import cppCode from './immutable_map.hpp?raw';
+import cppCode from '../include/imm/immutable_map.hpp?raw';
 
 const sections = [
   { id: 'overview', label: 'Overview' },

@@ -132,7 +132,6 @@ protected:
 
     // ----- allocation / deallocation via allocator_traits -----
     void allocate(std::size_t n, std::size_t m) {
-        // Rebind allocator to byte_type
         byte_alloc ba(get_alloc());
         data_ = byte_alloc_tr::allocate(ba, total_bytes(n, m));
     }
@@ -146,16 +145,10 @@ protected:
         }
     }
 
-    // ----- element lifetime via allocator_traits -----
+    // ----- element lifetime -----
     void destroy_elements() noexcept {
         pair_type* p = pairs();
         for (std::size_t i = size_; i > 0; --i) {
-            // Use allocator_traits::destroy — calls destructor,
-            // handles fancy pointers.
-            byte_alloc ba(get_alloc());
-            // We need pair allocator for destroy, but destroy just calls
-            // destructor. For raw pointers, allocator_traits::destroy
-            // simply calls p->~T(). This is noexcept.
             p[i - 1].~pair_type();
         }
     }
@@ -169,7 +162,6 @@ protected:
     }
 
     // ----- index building -----
-    // May throw if Hash::operator() throws.
     template <typename HashFn>
     void build_index(HashFn& hash_fn) {
         std::uint32_t* ix = index();
@@ -187,7 +179,6 @@ protected:
     }
 
     // ----- lookup -----
-    // noexcept only if Hash and KeyEq are noexcept.
     using size_type = std::size_t;
 
     template <typename CompatibleKey, typename HashFn, typename EqFn>
@@ -216,7 +207,6 @@ protected:
         : Alloc(alloc)
     {}
 
-    // Move
     map_storage(map_storage&& other) noexcept
         : Alloc(std::move(other.get_alloc()))
         , data_(other.data_)
@@ -244,7 +234,6 @@ protected:
 
     ~map_storage() { destroy_all(); }
 
-    // Adopt raw allocation (used by builder→map transfer)
     struct adopt_tag {};
 
     map_storage(adopt_tag, byte_type* data, std::size_t sz,
@@ -255,17 +244,12 @@ protected:
         , index_size_(idx_sz)
     {}
 
-    // Grant access
     friend class immutable_map_builder<Key, Value, Hash, KeyEq, Alloc>;
     template <typename, typename, bool> friend struct copy_support_base;
 };
 
 // ============================================================================
 // copy_support_base — CRTP base for conditional copy operations
-// ============================================================================
-// When Value is copy-constructible, provides copy ctor and copy assignment.
-// When not, copy ops are implicitly deleted (no overloads generated).
-// This avoids GCC8 issues with SFINAE on non-template operator=.
 // ============================================================================
 
 template <typename Derived, typename Value, bool>
@@ -276,10 +260,6 @@ struct copy_support_base {
 template <typename Derived, typename Value>
 struct copy_support_base<Derived, Value, true> {
 protected:
-    // Called by Derived's copy constructor.
-    // May throw if Key or Value copy constructor throws.
-    // On exception, already-constructed elements are cleaned up by
-    // Derived's destructor (which calls storage::destroy_all).
     void copy_from(const Derived& other) {
         auto& self = static_cast<Derived&>(*this);
         if (other.size() > 0) {
@@ -289,9 +269,6 @@ protected:
             self.size_       = n;
             self.index_size_ = m;
 
-            // Copy pairs one by one. If any throws, size_ tracks how
-            // many were constructed, so destroy_elements() in destructor
-            // will clean up correctly.
             auto* dst = self.pairs();
             const auto* src = other.pairs();
             std::size_t i = 0;
@@ -303,11 +280,9 @@ protected:
                             src[i].first, src[i].second);
                 }
             } catch (...) {
-                // Update size_ so destructor knows how many to destroy
                 self.size_ = i;
                 throw;
             }
-            // Copy index (cannot throw — trivial copy)
             std::memcpy(self.index(), other.index(),
                         m * sizeof(std::uint32_t));
         }
@@ -343,10 +318,8 @@ class immutable_map
     friend copy_base_t;
 
 public:
-    // Expose storage_t for copy_support_base access
     using storage_t = map_storage<Key, Value, Alloc>;
 
-    // ----- type aliases -----
     using key_type        = Key;
     using mapped_type     = Value;
     using value_type      = std::pair<const Key, Value>;
@@ -362,13 +335,8 @@ private:
     using typename storage_t::byte_type;
 
 public:
-    // ========================================================================
-    // Constructors / assignment / destructor
-    // ========================================================================
-
     immutable_map() noexcept(noexcept(storage_t())) = default;
 
-    // Move — noexcept (just pointer swap)
     immutable_map(immutable_map&& other) noexcept
         : storage_t(std::move(other))
     {}
@@ -378,8 +346,6 @@ public:
         return *this;
     }
 
-    // Copy — only available when Value is copy-constructible.
-    // May throw if Key/Value copy constructor throws.
     immutable_map(const immutable_map& other)
         : storage_t(other.get_alloc())
     {
@@ -390,11 +356,7 @@ public:
         return copy_base_t::copy_assign(*this, other);
     }
 
-    ~immutable_map() = default;  // storage handles cleanup
-
-    // ========================================================================
-    // Capacity
-    // ========================================================================
+    ~immutable_map() = default;
 
     size_type size()  const noexcept { return storage_t::size_; }
     bool      empty() const noexcept { return storage_t::size_ == 0; }
@@ -402,14 +364,6 @@ public:
     allocator_type get_allocator() const noexcept {
         return storage_t::get_alloc();
     }
-
-    // ========================================================================
-    // Lookup — heterogeneous: accepts any CompatibleKey
-    // ========================================================================
-    // User must ensure Hash and KeyEq work with CompatibleKey.
-    // E.g. Key=string, Hash=hash<string_view>, KeyEq=equal_to<string_view>
-    // allows find(string_view) without constructing a string.
-    // ========================================================================
 
     template <typename CompatibleKey>
     value_type* find(const CompatibleKey& key)
@@ -459,10 +413,6 @@ public:
                != static_cast<size_type>(-1);
     }
 
-    // ========================================================================
-    // Iterators — LegacyForwardIterator over value_type&
-    // ========================================================================
-
     template <bool IsConst>
     class basic_iterator {
         friend class immutable_map;
@@ -500,7 +450,6 @@ public:
             return pos_ != o.pos_;
         }
 
-        // Allow conversion iterator → const_iterator
         template <bool Other,
                   std::enable_if_t<IsConst && !Other, int> = 0>
         basic_iterator(const basic_iterator<Other>& o) noexcept
@@ -552,11 +501,9 @@ public:
         : storage_(alloc)
     {}
 
-    // Non-copyable
     immutable_map_builder(const immutable_map_builder&) = delete;
     immutable_map_builder& operator=(const immutable_map_builder&) = delete;
 
-    // Movable
     immutable_map_builder(immutable_map_builder&& other) noexcept
         : storage_(std::move(other.storage_))
         , capacity_(other.capacity_)
@@ -584,10 +531,6 @@ public:
         return storage_.get_alloc();
     }
 
-    /// Reserve space for n elements. Allocates the final memory block.
-    /// Must be called exactly once, before any emplace().
-    /// Throws: std::bad_alloc if allocation fails.
-    ///         std::logic_error if called more than once.
     void reserve(size_type n) {
         if (storage_.data_) {
             throw std::logic_error(
@@ -599,15 +542,6 @@ public:
         storage_.allocate(n, storage_.index_size_);
     }
 
-    /// Construct a key-value pair in-place.
-    /// Key is constructed from forwarded K.
-    /// Value is constructed from forwarded Args.
-    ///
-    /// Exception safety: if Value constructor throws, the already-constructed
-    /// Key is destroyed and the exception propagates. size_ is not incremented.
-    ///
-    /// Throws: std::logic_error if capacity exceeded.
-    ///         Any exception from Key or Value constructor.
     template <typename K, typename... Args>
     void emplace(K&& key, Args&&... args) {
         if (size_ >= capacity_) {
@@ -616,10 +550,6 @@ public:
                 "call reserve() first");
         }
 
-        // Work with raw memory to avoid const_cast on pair::first.
-        // pair<const Key, Value> layout: Key at offset 0, Value at
-        // align_up(sizeof(Key), alignof(Value)). We construct Key and
-        // Value independently via placement new on the raw storage.
         static constexpr std::size_t val_offset =
             detail::align_up(sizeof(Key), alignof(Value));
 
@@ -627,10 +557,8 @@ public:
         Key* key_ptr = reinterpret_cast<Key*>(raw);
         Value* val_ptr = reinterpret_cast<Value*>(raw + val_offset);
 
-        // Construct Key
         ::new (static_cast<void*>(key_ptr)) Key(std::forward<K>(key));
 
-        // Construct Value. If this throws, destroy the Key.
         try {
             ::new (static_cast<void*>(val_ptr))
                 Value(std::forward<Args>(args)...);
@@ -642,9 +570,6 @@ public:
         ++size_;
     }
 
-    /// Construct a key-value pair in-place (piecewise).
-    /// Key is constructed from key_args, Value from value_args.
-    /// Same exception safety as emplace.
     template <typename... KeyArgs, typename... ValueArgs>
     void try_emplace(std::piecewise_construct_t,
                      std::tuple<KeyArgs...> key_args,
@@ -662,11 +587,9 @@ public:
         Key* key_ptr = reinterpret_cast<Key*>(raw);
         Value* val_ptr = reinterpret_cast<Value*>(raw + val_offset);
 
-        // Construct Key from key_args
         ::new (static_cast<void*>(key_ptr))
             Key(std::make_from_tuple<Key>(std::move(key_args)));
 
-        // Construct Value from value_args. If this throws, destroy the Key.
         try {
             ::new (static_cast<void*>(val_ptr))
                 Value(std::make_from_tuple<Value>(std::move(value_args)));
@@ -678,7 +601,6 @@ public:
         ++size_;
     }
 
-    /// Convenience: try_emplace(key_arg, value_args...)
     template <typename K, typename... ValueArgs>
     void try_emplace(K&& key, ValueArgs&&... value_args) {
         try_emplace(std::piecewise_construct,
@@ -686,27 +608,20 @@ public:
                     std::forward_as_tuple(std::forward<ValueArgs>(value_args)...));
     }
 
-    /// Current number of elements inserted.
     size_type size() const noexcept { return size_; }
 
-    /// Finalize: build hash index and transfer ownership to immutable_map.
-    /// After build(), this builder is empty.
-    ///
-    /// Throws: any exception from Hash::operator() (unlikely for standard hashes).
     map_type build() {
         if (!storage_.data_ && capacity_ > 0) {
             throw std::logic_error(
                 "immutable_map_builder::build: reserve() was not called");
         }
 
-        // Build hash index
         storage_.size_ = size_;
         if (size_ > 0) {
             Hash hash_fn;
             storage_.build_index(hash_fn);
         }
 
-        // Transfer ownership to immutable_map
         map_type result(typename storage_t::adopt_tag{},
                         storage_.data_, size_, storage_.index_size_,
                         storage_.get_alloc());
@@ -720,15 +635,9 @@ public:
 };
 
 // ============================================================================
-// collect — construct immutable_map from a forward-iterator range
-// ============================================================================
-// collect:            range of { .first → Key, .second → Value }
-// collect_construct:  range of { .first → Key, .second → tuple<Args...> }
-//                     (Value constructed from unpacked tuple)
+// collect
 // ============================================================================
 
-/// Collect from range of {key, value} pairs.
-/// Value is copy/move-constructed from .second.
 template <typename Key, typename Value,
           typename Hash  = std::hash<Key>,
           typename KeyEq = std::equal_to<Key>,
@@ -747,7 +656,6 @@ collect(ForwardIt first, ForwardIt last) {
     return builder.build();
 }
 
-/// Convenience: collect from a range object (has begin/end).
 template <typename Key, typename Value,
           typename Hash  = std::hash<Key>,
           typename KeyEq = std::equal_to<Key>,
@@ -761,8 +669,6 @@ auto collect(const Range& range)
         std::begin(range), std::end(range));
 }
 
-/// Collect from range of {key, tuple<Args...>} pairs.
-/// Value is constructed via std::apply from the tuple.
 template <typename Key, typename Value,
           typename Hash  = std::hash<Key>,
           typename KeyEq = std::equal_to<Key>,
@@ -786,7 +692,6 @@ collect_construct(ForwardIt first, ForwardIt last) {
     return builder.build();
 }
 
-/// Convenience: collect_construct from a range object.
 template <typename Key, typename Value,
           typename Hash  = std::hash<Key>,
           typename KeyEq = std::equal_to<Key>,
