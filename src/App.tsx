@@ -293,20 +293,18 @@ using storage_alloc =
         <Section id="builder" title="Builder Pattern">
           <p className="text-slate-300 leading-relaxed mb-4">
             Вставка через <code className="text-emerald-400">immutable_map_builder</code>.
-            Основной метод — <code className="text-sky-400">try_emplace(piecewise, ...)</code>,
-            остальные выражаются через него.
+            Оба метода <code className="text-sky-400">try_emplace</code> и <code className="text-sky-400">emplace</code>
+            имеют два варианта: с piecewise для обоих (ключ и значение) и с piecewise только для значения.
           </p>
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 mb-4">
             <h4 className="text-white font-semibold mb-2 text-sm">API hierarchy</h4>
             <ul className="text-slate-300 text-sm space-y-1">
-              <li><code className="text-emerald-400">try_emplace(piecewise, key_tuple, value_tuple)</code> — core method</li>
-              <li className="pl-4 text-slate-500">↑</li>
-              <li><code className="text-sky-400">try_emplace(key, args...)</code> — convenience wrapper</li>
-              <li className="pl-4 text-slate-500">↑</li>
-              <li><code className="text-sky-400">emplace(key, args...)</code> — alias (standard compatibility)</li>
-              <li className="pl-4 text-slate-500">↑</li>
-              <li><code className="text-sky-400">insert(first, last)</code> — range of pairs</li>
-              <li><code className="text-sky-400">insert_piecewise(first, last)</code> — range of {'{'}key, tuple{'}'}</li>
+              <li><code className="text-emerald-400">try_emplace(piecewise, key_tuple, value_tuple)</code> — piecewise for both</li>
+              <li><code className="text-emerald-400">try_emplace(key, args...)</code> — key as-is, piecewise for value</li>
+              <li className="mt-2"><code className="text-sky-400">emplace(piecewise, key_tuple, value_tuple)</code> — piecewise for both</li>
+              <li><code className="text-sky-400">emplace(key, args...)</code> — alias for try_emplace</li>
+              <li className="mt-2"><code className="text-sky-400">insert(first, last)</code> — range of pairs {'{'}key, value{'}'}</li>
+              <li><code className="text-sky-400">insert_piecewise(first, last)</code> — range of {'{'}key, tuple{'}'}, piecewise for value only</li>
             </ul>
           </div>
           <CodeBlock
@@ -314,25 +312,30 @@ using storage_alloc =
             code={`imm::immutable_map_builder<std::string, int> builder;
 builder.reserve(100);                    // allocate once
 
-// Core method: piecewise construction
+// try_emplace: piecewise for both key and value
 builder.try_emplace(std::piecewise_construct,
                     std::forward_as_tuple("alpha"),
                     std::forward_as_tuple(1));
 
-// Convenience: try_emplace(key, args...)
+// try_emplace: key as-is, piecewise for value
 builder.try_emplace("beta", 2);
 
-// Alias: emplace(key, args...) — same as try_emplace
-builder.emplace("gamma", 3);
+// emplace: piecewise for both key and value
+builder.emplace(std::piecewise_construct,
+                std::forward_as_tuple("gamma"),
+                std::forward_as_tuple(3));
+
+// emplace: key as-is (alias for try_emplace)
+builder.emplace("delta", 4);
 
 // Range insertion: insert(first, last)
 std::vector<std::pair<std::string, int>> pairs = {
-    {"delta", 4}, {"epsilon", 5}
+    {"epsilon", 5}, {"zeta", 6}
 };
 builder.insert(pairs.begin(), pairs.end());
 
 // Range with tuple: insert_piecewise(first, last)
-// No std::apply — tuple passed directly to piecewise_construct
+// Piecewise only for value, key as-is
 struct Point { int x, y; Point(int a, int b) : x(a), y(b) {} };
 std::vector<std::pair<std::string, std::tuple<int, int>>> data = {
     {"origin", {0, 0}}
@@ -340,7 +343,7 @@ std::vector<std::pair<std::string, std::tuple<int, int>>> data = {
 builder.insert_piecewise(data.begin(), data.end());
 
 auto map = builder.build();              // build index, transfer ownership
-assert(map.size() == 6);
+assert(map.size() == 7);
 
 // Values are mutable:
 map.at("beta") = 42;
@@ -420,6 +423,7 @@ map.find("literal");               // OK — implicit → string_view`}
             Функции <code className="text-emerald-400">collect</code> и{' '}
             <code className="text-emerald-400">collect_piecewise</code> — convenience wrappers
             над <code className="text-sky-400">insert</code> и <code className="text-sky-400">insert_piecewise</code>.
+            <code className="text-sky-400">collect</code> имеет перегрузку с автоматическим выводом типов.
           </p>
           <CodeBlock
             language="cpp"
@@ -428,9 +432,13 @@ map.find("literal");               // OK — implicit → string_view`}
 std::vector<std::pair<std::string, int>> pairs = {
     {"one", 1}, {"two", 2}, {"three", 3}
 };
+
+// With explicit types
 auto m1 = imm::collect<std::string, int>(pairs.begin(), pairs.end());
-// or:
 auto m1b = imm::collect<std::string, int>(pairs);
+
+// With automatic type deduction (from pair<K,V>)
+auto m1c = imm::collect(pairs);  // Deduces map<string, int>
 
 // collect_piecewise: range of {key, tuple<args...>}
 // Internally: builder.reserve(n); builder.insert_piecewise(first, last); builder.build();
@@ -477,19 +485,21 @@ assert(m2.at("origin").x == 0);`}
           <h3 className="text-lg font-semibold text-white mb-3">immutable_map_builder</h3>
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 mb-6">
             <Param name="reserve(n)" type="void" desc="Throws: bad_alloc, logic_error" />
-            <Param name="try_emplace(piecewise, kt, vt)" type="void" desc="Core method. Piecewise construction." />
-            <Param name="try_emplace(key, args...)" type="void" desc="Convenience wrapper over piecewise." />
-            <Param name="emplace(key, args...)" type="void" desc="Alias for try_emplace (standard compat)." />
-            <Param name="insert(first, last)" type="void" desc="Range of pairs. Uses emplace internally." />
-            <Param name="insert_piecewise(first, last)" type="void" desc="Range of {key, tuple}. No std::apply needed." />
+            <Param name="try_emplace(piecewise, kt, vt)" type="void" desc="Piecewise for both key and value" />
+            <Param name="try_emplace(key, args...)" type="void" desc="Key as-is, piecewise for value" />
+            <Param name="emplace(piecewise, kt, vt)" type="void" desc="Piecewise for both key and value" />
+            <Param name="emplace(key, args...)" type="void" desc="Alias for try_emplace (standard compat)" />
+            <Param name="insert(first, last)" type="void" desc="Range of pairs {key, value}" />
+            <Param name="insert_piecewise(first, last)" type="void" desc="Range of {key, tuple}, piecewise for value only" />
             <Param name="build()" type="→ immutable_map" desc="Throws: logic_error, Hash exceptions." />
             <Param name="size()" type="→ size_type" desc="noexcept" />
           </div>
 
           <h3 className="text-lg font-semibold text-white mb-3">Free Functions</h3>
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4">
-            <Param name="collect<K,V>(first, last)" type="→ immutable_map" desc="From {key, value} range" />
-            <Param name="collect<K,V>(range)" type="→ immutable_map" desc="From range object" />
+            <Param name="collect<K,V>(first, last)" type="→ immutable_map" desc="From {key, value} range with explicit types" />
+            <Param name="collect<K,V>(range)" type="→ immutable_map" desc="From range object with explicit types" />
+            <Param name="collect(range)" type="→ immutable_map" desc="Automatic type deduction from pair<K,V>" />
             <Param name="collect_piecewise<K,V>(first, last)" type="→ immutable_map" desc="From {key, tuple<args...>} range" />
             <Param name="collect_piecewise<K,V>(range)" type="→ immutable_map" desc="From range object" />
           </div>

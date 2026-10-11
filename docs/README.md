@@ -94,14 +94,50 @@ b.emplace("b", 20);
 auto m = b.build();  // OK — values never moved
 ```
 
+## Builder API
+
+### `try_emplace` — two variants
+
+```cpp
+// 1. Piecewise construction for both key and value
+builder.try_emplace(std::piecewise_construct, key_tuple, value_tuple);
+
+// 2. Key as-is, piecewise for value
+builder.try_emplace(key, args...);
+```
+
+### `emplace` — symmetric to `try_emplace`
+
+```cpp
+// 1. Piecewise construction for both key and value
+builder.emplace(std::piecewise_construct, key_tuple, value_tuple);
+
+// 2. Key as-is, piecewise for value (alias for try_emplace)
+builder.emplace(key, args...);
+```
+
+### Range insertion
+
+```cpp
+// Insert range of pairs {key, value}
+builder.insert(first, last);
+
+// Insert range of pairs {key, tuple<args...>}
+// Piecewise only for value, key as-is
+builder.insert_piecewise(first, last);
+```
+
 ## Collect from Range
 
 ```cpp
-// From pairs
+// From pairs with explicit types
 std::vector<std::pair<std::string, int>> pairs = {
     {"one", 1}, {"two", 2}
 };
 auto m1 = imm::collect<std::string, int>(pairs);
+
+// From pairs with automatic type deduction
+auto m1b = imm::collect(pairs);  // Deduces map<string, int>
 
 // From tuples (Value constructed from tuple)
 // No std::apply needed — tuple passed directly to piecewise_construct

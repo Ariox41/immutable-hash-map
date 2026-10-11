@@ -622,6 +622,16 @@ public:
                     std::forward_as_tuple(std::forward<ValueArgs>(value_args)...));
     }
 
+    // emplace(piecewise, key_tuple, value_tuple) — piecewise for both key and value
+    template <typename... KeyArgs, typename... ValueArgs>
+    void emplace(std::piecewise_construct_t,
+                 std::tuple<KeyArgs...> key_args,
+                 std::tuple<ValueArgs...> value_args) {
+        try_emplace(std::piecewise_construct,
+                    std::move(key_args),
+                    std::move(value_args));
+    }
+
     // emplace(key, args...) — alias for try_emplace (standard compatibility)
     template <typename K, typename... Args>
     void emplace(K&& key, Args&&... args) {
@@ -711,6 +721,20 @@ auto collect(const Range& range)
 {
     return collect<Key, Value, Hash, KeyEq, Alloc>(
         std::begin(range), std::end(range));
+}
+
+// collect with automatic type deduction from pair<K,V>
+template <typename Range,
+          typename = std::enable_if_t<!std::is_same_v<std::decay_t<Range>, std::string>>>
+auto collect(const Range& range)
+    -> immutable_map<
+        typename std::iterator_traits<decltype(std::begin(range))>::value_type::first_type,
+        typename std::iterator_traits<decltype(std::begin(range))>::value_type::second_type>
+{
+    using value_type = typename std::iterator_traits<decltype(std::begin(range))>::value_type;
+    using Key = typename value_type::first_type;
+    using Value = typename value_type::second_type;
+    return collect<Key, Value>(range);
 }
 
 template <typename Key, typename Value,
