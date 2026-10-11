@@ -377,6 +377,10 @@ public:
     using allocator_type  = Alloc;
     using reference       = value_type&;
     using const_reference = const value_type&;
+    
+    // Iterators are raw pointers - value_type* is a valid forward iterator
+    using iterator       = value_type*;
+    using const_iterator = const value_type*;
 
 private:
     using typename storage_t::byte_type;
@@ -404,6 +408,13 @@ public:
     }
 
     ~immutable_map() = default;
+
+    // Constructor for builder::build() - adopts storage data
+    immutable_map(typename storage_t::adopt_tag,
+                  byte_type* data, std::size_t sz,
+                  std::size_t idx_sz, Alloc a) noexcept
+        : storage_t(typename storage_t::adopt_tag{}, data, sz, idx_sz, std::move(a))
+    {}
 
     size_type size()  const noexcept { return storage_t::size_; }
     bool      empty() const noexcept { return storage_t::size_ == 0; }
@@ -459,10 +470,6 @@ public:
         return storage_t::find_slot(key, hash_fn, eq_fn)
                != static_cast<size_type>(-1);
     }
-
-    // Iterators are raw pointers - value_type* is a valid forward iterator
-    using iterator       = value_type*;
-    using const_iterator = const value_type*;
 
     iterator       begin()        noexcept { return storage_t::pairs(); }
     iterator       end()          noexcept { return storage_t::end_ptr(); }
