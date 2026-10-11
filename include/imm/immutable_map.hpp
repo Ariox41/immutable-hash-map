@@ -638,15 +638,14 @@ public:
         }
     }
 
-    // insert_construct(first, last) — insert range of {key, tuple<args...>}
+    // insert_piecewise(first, last) — insert range of {key, tuple<args...>}
+    // No std::apply needed — tuple passed directly to piecewise_construct
     template <typename ForwardIt>
-    void insert_construct(ForwardIt first, ForwardIt last) {
+    void insert_piecewise(ForwardIt first, ForwardIt last) {
         for (; first != last; ++first) {
-            std::apply(
-                [&](auto&&... args) {
-                    emplace((*first).first, std::forward<decltype(args)>(args)...);
-                },
-                (*first).second);
+            try_emplace(std::piecewise_construct,
+                        std::forward_as_tuple((*first).first),
+                        (*first).second);
         }
     }
 
@@ -720,11 +719,11 @@ template <typename Key, typename Value,
           typename Alloc = std::allocator<std::byte>,
           typename ForwardIt>
 immutable_map<Key, Value, Hash, KeyEq, Alloc>
-collect_construct(ForwardIt first, ForwardIt last) {
+collect_piecewise(ForwardIt first, ForwardIt last) {
     const auto n = static_cast<std::size_t>(std::distance(first, last));
     immutable_map_builder<Key, Value, Hash, KeyEq, Alloc> builder;
     builder.reserve(n);
-    builder.insert_construct(first, last);
+    builder.insert_piecewise(first, last);
     return builder.build();
 }
 
@@ -733,11 +732,11 @@ template <typename Key, typename Value,
           typename KeyEq = std::equal_to<Key>,
           typename Alloc = std::allocator<std::byte>,
           typename Range>
-auto collect_construct(const Range& range)
-    -> decltype(collect_construct<Key, Value, Hash, KeyEq, Alloc>(
+auto collect_piecewise(const Range& range)
+    -> decltype(collect_piecewise<Key, Value, Hash, KeyEq, Alloc>(
             std::begin(range), std::end(range)))
 {
-    return collect_construct<Key, Value, Hash, KeyEq, Alloc>(
+    return collect_piecewise<Key, Value, Hash, KeyEq, Alloc>(
         std::begin(range), std::end(range));
 }
 

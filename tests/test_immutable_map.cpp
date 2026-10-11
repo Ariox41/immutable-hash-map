@@ -290,7 +290,7 @@ TEST(collect_pairs) {
     ASSERT(m.at("three") == 3);
 }
 
-TEST(collect_construct) {
+TEST(collect_piecewise) {
     struct Point {
         int x, y;
         Point(int a, int b) : x(a), y(b) {}
@@ -301,7 +301,7 @@ TEST(collect_construct) {
         {"unit", {1, 1}},
         {"other", {5, 10}},
     };
-    auto m = imm::collect_construct<std::string, Point>(data);
+    auto m = imm::collect_piecewise<std::string, Point>(data);
     ASSERT(m.size() == 3);
     ASSERT(m.at("origin").x == 0);
     ASSERT(m.at("origin").y == 0);

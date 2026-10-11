@@ -306,7 +306,7 @@ using storage_alloc =
               <li><code className="text-sky-400">emplace(key, args...)</code> — alias (standard compatibility)</li>
               <li className="pl-4 text-slate-500">↑</li>
               <li><code className="text-sky-400">insert(first, last)</code> — range of pairs</li>
-              <li><code className="text-sky-400">insert_construct(first, last)</code> — range of {'{'}key, tuple{'}'}</li>
+              <li><code className="text-sky-400">insert_piecewise(first, last)</code> — range of {'{'}key, tuple{'}'}</li>
             </ul>
           </div>
           <CodeBlock
@@ -331,12 +331,13 @@ std::vector<std::pair<std::string, int>> pairs = {
 };
 builder.insert(pairs.begin(), pairs.end());
 
-// Range with tuple: insert_construct(first, last)
+// Range with tuple: insert_piecewise(first, last)
+// No std::apply — tuple passed directly to piecewise_construct
 struct Point { int x, y; Point(int a, int b) : x(a), y(b) {} };
 std::vector<std::pair<std::string, std::tuple<int, int>>> data = {
     {"origin", {0, 0}}
 };
-builder.insert_construct(data.begin(), data.end());
+builder.insert_piecewise(data.begin(), data.end());
 
 auto map = builder.build();              // build index, transfer ownership
 assert(map.size() == 6);
@@ -417,8 +418,8 @@ map.find("literal");               // OK — implicit → string_view`}
         <Section id="collect" title="Collect from Range">
           <p className="text-slate-300 leading-relaxed mb-4">
             Функции <code className="text-emerald-400">collect</code> и{' '}
-            <code className="text-emerald-400">collect_construct</code> — convenience wrappers
-            над <code className="text-sky-400">insert</code> и <code className="text-sky-400">insert_construct</code>.
+            <code className="text-emerald-400">collect_piecewise</code> — convenience wrappers
+            над <code className="text-sky-400">insert</code> и <code className="text-sky-400">insert_piecewise</code>.
           </p>
           <CodeBlock
             language="cpp"
@@ -431,8 +432,9 @@ auto m1 = imm::collect<std::string, int>(pairs.begin(), pairs.end());
 // or:
 auto m1b = imm::collect<std::string, int>(pairs);
 
-// collect_construct: range of {key, tuple<args...>}
-// Internally: builder.reserve(n); builder.insert_construct(first, last); builder.build();
+// collect_piecewise: range of {key, tuple<args...>}
+// Internally: builder.reserve(n); builder.insert_piecewise(first, last); builder.build();
+// No std::apply needed — tuple passed directly to piecewise_construct
 struct Point { int x, y; Point(int a, int b) : x(a), y(b) {} };
 
 std::vector<std::pair<std::string, std::tuple<int, int>>> data = {
@@ -440,7 +442,7 @@ std::vector<std::pair<std::string, std::tuple<int, int>>> data = {
     {"unit",   {1, 1}},
 };
 // Point constructed as Point(0,0), Point(1,1)
-auto m2 = imm::collect_construct<std::string, Point>(data);
+auto m2 = imm::collect_piecewise<std::string, Point>(data);
 assert(m2.at("origin").x == 0);`}
           />
           <p className="text-slate-300 leading-relaxed mt-4">
@@ -479,7 +481,7 @@ assert(m2.at("origin").x == 0);`}
             <Param name="try_emplace(key, args...)" type="void" desc="Convenience wrapper over piecewise." />
             <Param name="emplace(key, args...)" type="void" desc="Alias for try_emplace (standard compat)." />
             <Param name="insert(first, last)" type="void" desc="Range of pairs. Uses emplace internally." />
-            <Param name="insert_construct(first, last)" type="void" desc="Range of {key, tuple}. Uses emplace internally." />
+            <Param name="insert_piecewise(first, last)" type="void" desc="Range of {key, tuple}. No std::apply needed." />
             <Param name="build()" type="→ immutable_map" desc="Throws: logic_error, Hash exceptions." />
             <Param name="size()" type="→ size_type" desc="noexcept" />
           </div>
@@ -488,8 +490,8 @@ assert(m2.at("origin").x == 0);`}
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4">
             <Param name="collect<K,V>(first, last)" type="→ immutable_map" desc="From {key, value} range" />
             <Param name="collect<K,V>(range)" type="→ immutable_map" desc="From range object" />
-            <Param name="collect_construct<K,V>(first, last)" type="→ immutable_map" desc="From {key, tuple<args...>} range" />
-            <Param name="collect_construct<K,V>(range)" type="→ immutable_map" desc="From range object" />
+            <Param name="collect_piecewise<K,V>(first, last)" type="→ immutable_map" desc="From {key, tuple<args...>} range" />
+            <Param name="collect_piecewise<K,V>(range)" type="→ immutable_map" desc="From range object" />
           </div>
         </Section>
 

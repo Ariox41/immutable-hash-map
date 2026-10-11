@@ -104,11 +104,12 @@ std::vector<std::pair<std::string, int>> pairs = {
 auto m1 = imm::collect<std::string, int>(pairs);
 
 // From tuples (Value constructed from tuple)
+// No std::apply needed — tuple passed directly to piecewise_construct
 struct Point { int x, y; Point(int a, int b) : x(a), y(b) {} };
 std::vector<std::pair<std::string, std::tuple<int, int>>> data = {
     {"origin", {0, 0}}, {"unit", {1, 1}}
 };
-auto m2 = imm::collect_construct<std::string, Point>(data);
+auto m2 = imm::collect_piecewise<std::string, Point>(data);
 ```
 
 ## Building
