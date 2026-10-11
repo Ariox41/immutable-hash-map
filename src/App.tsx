@@ -216,7 +216,7 @@ export default function App() {
                 </li>
                 <li className="flex gap-2">
                   <span className="text-emerald-400 shrink-0">•</span>
-                  <span><code className="text-sky-300">std::launder</code> for index access; pair access via <code className="text-sky-300">reinterpret_cast</code> (pragmatic — pair not formally created as whole)</span>
+                  <span><code className="text-sky-300">std::launder</code> for all pointer access after reinterpret_cast</span>
                 </li>
                 <li className="flex gap-2">
                   <span className="text-emerald-400 shrink-0">•</span>
@@ -229,35 +229,25 @@ export default function App() {
           <div className="mt-6 bg-slate-900 border border-slate-800 rounded-lg p-5">
             <h3 className="text-white font-semibold mb-3">Exception safety in emplace</h3>
             <p className="text-slate-300 text-sm mb-3">
-              Если конструктор Value бросает исключение, уже сконструированный Key уничтожается через{' '}
-              <code className="text-sky-300">allocator_traits::destroy</code>.
-              <code className="text-sky-300">size_</code> не инкрементируется. Key и Value конструируются
-              через <code className="text-sky-300">allocator_traits::construct</code> с rebound аллокаторами.
+              Используем <code className="text-sky-300">std::pair</code> piecewise constructor.
+              Если конструктор Value бросает — pair не создан, ничего не нужно уничтожать.
+              <code className="text-sky-300">size_</code> не инкрементируется.
             </p>
             <CodeBlock
               language="cpp"
               code={`// In emplace():
-using key_alloc = typename alloc_traits::template rebind_alloc<Key>;
-using key_alloc_tr = std::allocator_traits<key_alloc>;
-using val_alloc = typename alloc_traits::template rebind_alloc<Value>;
-using val_alloc_tr = std::allocator_traits<val_alloc>;
+using pair_alloc    = typename storage_t::pair_alloc;
+using pair_alloc_tr = typename storage_t::pair_alloc_tr;
+pair_alloc pa(get_alloc());
 
-char* raw = reinterpret_cast<char*>(pairs() + size_);
-Key*   key_ptr = reinterpret_cast<Key*>(raw);
-Value* val_ptr = reinterpret_cast<Value*>(
-    raw + align_up(sizeof(Key), alignof(Value)));
+pair_alloc_tr::construct(pa, pair_at(size_),
+                         std::piecewise_construct,
+                         std::forward_as_tuple(std::forward<K>(key)),
+                         std::forward_as_tuple(std::forward<Args>(args)...));
+++size_;
 
-key_alloc ka(get_alloc());
-val_alloc va(get_alloc());
-
-key_alloc_tr::construct(ka, key_ptr, std::forward<K>(key));
-try {
-    val_alloc_tr::construct(va, val_ptr, std::forward<Args>(args)...);
-} catch (...) {
-    key_alloc_tr::destroy(ka, key_ptr);   // rollback
-    throw;
-}
-++size_;`}
+// If Value constructor throws inside piecewise_construct,
+// pair is not created — no cleanup needed. Simple!`}
             />
           </div>
 
@@ -289,15 +279,12 @@ using storage_alloc =
               <strong className="text-white">std::launder</strong> используется для:
             </p>
             <ul className="text-slate-300 text-sm space-y-1 ml-4">
+              <li>• <code className="text-sky-300">pair_at(i)</code> — доступ к i-й паре через reinterpret_cast</li>
               <li>• <code className="text-sky-300">index()</code> — доступ к массиву uint32_t через reinterpret_cast</li>
-              <li>• <code className="text-sky-300">emplace</code> catch-блок — <code className="text-sky-300">destroy(ka, std::launder(key_ptr))</code></li>
             </ul>
             <p className="text-slate-300 text-sm mt-2">
-              <strong className="text-white">Не используется</strong> для pair access:
-              Key и Value конструируются отдельно (не pair целиком), поэтому объект{' '}
-              <code className="text-sky-300">pair_type</code> формально не создан.
-              <code className="text-sky-300">reinterpret_cast</code> без launder — pragmatic approach,
-              работает на всех известных компиляторах.
+              Pair создаётся целиком через piecewise constructor, поэтому <code className="text-sky-300">std::launder</code>{' '}
+              корректен для pair access.
             </p>
           </div>
         </Section>

@@ -121,24 +121,21 @@ protected:
         return m;
     }
 
-    // ----- centralized pointer access -----
-    // Note: we construct Key and Value separately (not the whole pair),
-    // so pair_type object is not formally created. We use reinterpret_cast
-    // without std::launder for pair access (pragmatic approach — works on
-    // all known compilers, technically UB by strict aliasing but std::byte*
-    // is an exception to strict aliasing rules).
+    // ----- centralized pointer access with std::launder -----
+    // pair_type is constructed via piecewise constructor, so the object
+    // is formally created. std::launder is used for correct strict aliasing.
     
     pair_type* pair_at(std::size_t i) noexcept {
-        return reinterpret_cast<pair_type*>(
-            data_ + i * sizeof(pair_type));
+        return std::launder(reinterpret_cast<pair_type*>(
+            data_ + i * sizeof(pair_type)));
     }
 
     const pair_type* pair_at(std::size_t i) const noexcept {
-        return reinterpret_cast<const pair_type*>(
-            data_ + i * sizeof(pair_type));
+        return std::launder(reinterpret_cast<const pair_type*>(
+            data_ + i * sizeof(pair_type)));
     }
 
-    // pairs(): pointer to first pair (valid when size_ > 0, or for empty map comparison)
+    // pairs(): pointer to first pair (valid when size_ > 0, or for empty map)
     pair_type* pairs() noexcept {
         return pair_at(0);
     }
@@ -147,7 +144,7 @@ protected:
         return pair_at(0);
     }
 
-    // end_ptr(): past-the-end pointer
+    // end_ptr(): past-the-end pointer (no std::launder — no object there)
     pair_type* end_ptr() noexcept {
         return reinterpret_cast<pair_type*>(
             data_ + size_ * sizeof(pair_type));
@@ -598,32 +595,16 @@ public:
                 "call reserve() first");
         }
 
-        // Construct Key and Value separately via allocator_traits.
-        using key_alloc    = typename alloc_traits::template rebind_alloc<Key>;
-        using key_alloc_tr = std::allocator_traits<key_alloc>;
-        using val_alloc    = typename alloc_traits::template rebind_alloc<Value>;
-        using val_alloc_tr = std::allocator_traits<val_alloc>;
+        // Construct pair via piecewise constructor.
+        // If Value constructor throws, pair is not created — no cleanup needed.
+        using pair_alloc    = typename storage_t::pair_alloc;
+        using pair_alloc_tr = typename storage_t::pair_alloc_tr;
+        pair_alloc pa(storage_.get_alloc());
 
-        // Compute offset of Value within pair_type
-        static constexpr std::size_t val_offset =
-            detail::align_up(sizeof(Key), alignof(Value));
-
-        // Get raw pointer to slot
-        byte_type* slot_raw = storage_.data_ + size_ * sizeof(value_type);
-        Key* key_ptr = reinterpret_cast<Key*>(slot_raw);
-        Value* val_ptr = reinterpret_cast<Value*>(slot_raw + val_offset);
-
-        key_alloc ka(storage_.get_alloc());
-        val_alloc va(storage_.get_alloc());
-
-        key_alloc_tr::construct(ka, key_ptr, std::forward<K>(key));
-
-        try {
-            val_alloc_tr::construct(va, val_ptr, std::forward<Args>(args)...);
-        } catch (...) {
-            key_alloc_tr::destroy(ka, std::launder(key_ptr));
-            throw;
-        }
+        pair_alloc_tr::construct(pa, storage_.pair_at(size_),
+                                 std::piecewise_construct,
+                                 std::forward_as_tuple(std::forward<K>(key)),
+                                 std::forward_as_tuple(std::forward<Args>(args)...));
 
         ++size_;
     }
@@ -638,31 +619,16 @@ public:
                 "call reserve() first");
         }
 
-        using key_alloc    = typename alloc_traits::template rebind_alloc<Key>;
-        using key_alloc_tr = std::allocator_traits<key_alloc>;
-        using val_alloc    = typename alloc_traits::template rebind_alloc<Value>;
-        using val_alloc_tr = std::allocator_traits<val_alloc>;
+        // Construct pair via piecewise constructor.
+        // If Value constructor throws, pair is not created — no cleanup needed.
+        using pair_alloc    = typename storage_t::pair_alloc;
+        using pair_alloc_tr = typename storage_t::pair_alloc_tr;
+        pair_alloc pa(storage_.get_alloc());
 
-        static constexpr std::size_t val_offset =
-            detail::align_up(sizeof(Key), alignof(Value));
-
-        byte_type* slot_raw = storage_.data_ + size_ * sizeof(value_type);
-        Key* key_ptr = reinterpret_cast<Key*>(slot_raw);
-        Value* val_ptr = reinterpret_cast<Value*>(slot_raw + val_offset);
-
-        key_alloc ka(storage_.get_alloc());
-        val_alloc va(storage_.get_alloc());
-
-        key_alloc_tr::construct(ka, key_ptr,
-                                std::make_from_tuple<Key>(std::move(key_args)));
-
-        try {
-            val_alloc_tr::construct(va, val_ptr,
-                                    std::make_from_tuple<Value>(std::move(value_args)));
-        } catch (...) {
-            key_alloc_tr::destroy(ka, std::launder(key_ptr));
-            throw;
-        }
+        pair_alloc_tr::construct(pa, storage_.pair_at(size_),
+                                 std::piecewise_construct,
+                                 std::move(key_args),
+                                 std::move(value_args));
 
         ++size_;
     }
