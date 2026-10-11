@@ -9,7 +9,6 @@ const sections = [
   { id: 'hetero', label: 'Hetero Lookup' },
   { id: 'collect', label: 'Collect' },
   { id: 'api', label: 'API' },
-  { id: 'examples', label: 'Examples' },
   { id: 'source', label: 'Source' },
 ];
 
@@ -120,14 +119,14 @@ export default function App() {
           <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4 mt-6">
             {[
               { icon: '🔒', title: 'Immutable structure', desc: 'Keys and topology fixed after build()' },
-              { icon: '📦', title: 'Single allocation', desc: 'Pairs and hash index in one memory block' },
+              { icon: '📦', title: 'Single allocation', desc: 'Pairs and hash index in one block' },
               { icon: '🏗️', title: 'Builder pattern', desc: 'reserve → emplace → build' },
-              { icon: '🧩', title: 'Allocator-aware', desc: 'Any standard-compatible allocator' },
-              { icon: '🚫', title: 'No move/copy for Value', desc: 'Values constructed in-place, never moved' },
+              { icon: '🧩', title: 'allocator_traits', desc: 'All ops via traits; EBO via inheritance' },
+              { icon: '🚫', title: 'No move/copy for Value', desc: 'Values constructed in-place' },
               { icon: '📐', title: 'Copy via CRTP base', desc: 'Copy ops only when Value is copyable' },
               { icon: '🔍', title: 'Heterogeneous lookup', desc: 'find(string_view) on map<string, ...>' },
-              { icon: '🔗', title: 'std::pair<const K, V>', desc: 'Standard pair type, compatible iterators' },
-              { icon: '📊', title: 'Forward iterator', desc: 'Returns pair&, not proxy' },
+              { icon: '🔗', title: 'std::pair<const K, V>', desc: 'Standard pair type, real pair& iterator' },
+              { icon: '🛡️', title: 'Exception safety', desc: 'Key rollback if Value ctor throws' },
             ].map((item) => (
               <div key={item.title} className="bg-slate-900 border border-slate-800 rounded-lg p-4">
                 <div className="text-2xl mb-2">{item.icon}</div>
@@ -172,7 +171,7 @@ export default function App() {
               <div className="font-mono text-sm space-y-2 text-slate-300">
                 <div>
                   <span className="text-sky-400">map_storage</span>
-                  <span className="text-slate-500"> — allocation, layout, lifetime</span>
+                  <span className="text-slate-500"> : private Alloc</span>
                 </div>
                 <div className="pl-4 text-slate-500">↑ private</div>
                 <div>
@@ -182,7 +181,7 @@ export default function App() {
                 <div className="pl-4 text-slate-500">↑ private</div>
                 <div>
                   <span className="text-purple-400">copy_support_base</span>
-                  <span className="text-slate-500"> — conditional copy ops (CRTP)</span>
+                  <span className="text-slate-500"> — conditional copy (CRTP)</span>
                 </div>
               </div>
               <div className="mt-4 pt-3 border-t border-slate-800">
@@ -201,55 +200,51 @@ export default function App() {
             </div>
 
             <div className="bg-slate-900 border border-slate-800 rounded-lg p-5">
-              <h3 className="text-white font-semibold mb-3">Why pairs together?</h3>
+              <h3 className="text-white font-semibold mb-3">Allocator: EBO + traits</h3>
               <ul className="text-slate-300 text-sm space-y-2">
                 <li className="flex gap-2">
                   <span className="text-emerald-400 shrink-0">•</span>
-                  <span>Iterator returns real <code className="text-sky-300">pair&amp;</code> — compatible with std algorithms</span>
+                  <span><code className="text-sky-300">map_storage</code> inherits from <code className="text-sky-300">Alloc</code> privately — EBO for stateless allocators (zero overhead)</span>
                 </li>
                 <li className="flex gap-2">
                   <span className="text-emerald-400 shrink-0">•</span>
-                  <span>Structured bindings work natively</span>
+                  <span>All allocation/deallocation via <code className="text-sky-300">std::allocator_traits</code></span>
                 </li>
                 <li className="flex gap-2">
                   <span className="text-emerald-400 shrink-0">•</span>
-                  <span>Key + value in same cache line during lookup</span>
+                  <span>Rebind to <code className="text-sky-300">std::byte</code> for raw memory</span>
                 </li>
                 <li className="flex gap-2">
                   <span className="text-emerald-400 shrink-0">•</span>
-                  <span><code className="text-sky-300">const Key</code> makes pair non-movable — exactly what we need</span>
+                  <span>No <code className="text-sky-300">capacity_</code> in storage — only in builder</span>
                 </li>
               </ul>
             </div>
           </div>
 
           <div className="mt-6 bg-slate-900 border border-slate-800 rounded-lg p-5">
-            <h3 className="text-white font-semibold mb-3">Copy via CRTP inheritance</h3>
+            <h3 className="text-white font-semibold mb-3">Exception safety in emplace</h3>
             <p className="text-slate-300 text-sm mb-3">
-              Copy constructor и copy assignment генерируются условно через базовый класс{' '}
-              <code className="text-purple-400">copy_support_base</code>. Если Value не копируем — базовый класс
-              пустой, copy ops implicitly deleted. Работает на GCC8+ без проблем с SFINAE на non-template operator=.
+              Если конструктор Value бросает исключение, уже сконструированный Key уничтожается.
+              <code className="text-sky-300">size_</code> не инкрементируется. Размещение через raw memory
+              (без <code className="text-sky-300">const_cast</code> на <code className="text-sky-300">pair::first</code>).
             </p>
             <CodeBlock
               language="cpp"
-              code={`template <typename Derived, typename Value,
-          bool = std::is_copy_constructible_v<Value>>
-struct copy_support_base {
-    // Value NOT copyable: copy ops implicitly deleted
-};
+              code={`// In emplace():
+char* raw = reinterpret_cast<char*>(pairs() + size_);
+Key*   key_ptr = reinterpret_cast<Key*>(raw);
+Value* val_ptr = reinterpret_cast<Value*>(
+    raw + align_up(sizeof(Key), alignof(Value)));
 
-template <typename Derived, typename Value>
-struct copy_support_base<Derived, Value, true> {
-    void copy_from(const Derived& other) { /* ... */ }
-    Derived& copy_assign(Derived& self, const Derived& other) { /* ... */ }
-};
-
-class immutable_map
-    : private map_storage<...>,
-      private copy_support_base<immutable_map, Value> {
-    // Copy ctor calls copy_base_t::copy_from(other)
-    // Copy assign calls copy_base_t::copy_assign(*this, other)
-};`}
+::new (key_ptr) Key(std::forward<K>(key));
+try {
+    ::new (val_ptr) Value(std::forward<Args>(args)...);
+} catch (...) {
+    key_ptr->~Key();   // rollback
+    throw;
+}
+++size_;`}
             />
           </div>
         </Section>
@@ -257,9 +252,10 @@ class immutable_map
         {/* Builder */}
         <Section id="builder" title="Builder Pattern">
           <p className="text-slate-300 leading-relaxed mb-4">
-            Вставка элементов через <code className="text-emerald-400">immutable_map_builder</code>.
-            Память выделяется один раз в <code className="text-sky-400">reserve()</code>,
-            объекты конструируются in-place, индекс строится в <code className="text-sky-400">build()</code>.
+            Вставка через <code className="text-emerald-400">immutable_map_builder</code>.
+            Три метода вставки: <code className="text-sky-400">emplace</code>,{' '}
+            <code className="text-sky-400">try_emplace(piecewise, ...)</code>,{' '}
+            <code className="text-sky-400">try_emplace(key, args...)</code>.
           </p>
           <CodeBlock
             language="cpp"
@@ -267,19 +263,23 @@ class immutable_map
 builder.reserve(100);                    // allocate once
 builder.emplace("alpha", 1);             // in-place construction
 builder.emplace("beta", 2);
-builder.emplace("gamma", 3);
-auto map = builder.build();              // build index, transfer ownership
 
-// After build(), builder is empty. map owns the data.
-assert(map.size() == 3);
-assert(map.at("beta") == 2);
+// try_emplace — piecewise construction
+builder.try_emplace(std::piecewise_construct,
+                    std::forward_as_tuple("gamma"),
+                    std::forward_as_tuple(3));
+
+// try_emplace — convenience overload
+builder.try_emplace("delta", 4);
+
+auto map = builder.build();              // build index, transfer ownership
+assert(map.size() == 4);
 
 // Values are mutable:
 map.at("beta") = 42;
-assert(map.at("beta") == 42);
 
 // Keys are immutable (const Key in pair):
-// map.begin()->first = "delta";  // ERROR: const std::string&`}
+// map.begin()->first = "x";  // ERROR: const std::string&`}
           />
           <p className="text-slate-300 leading-relaxed mt-4 mb-4">
             Для значений без конструктора копирования/перемещения:
@@ -295,7 +295,7 @@ assert(map.at("beta") == 42);
 
 imm::immutable_map_builder<std::string, NonMovable> b;
 b.reserve(2);
-b.emplace("a", 10);    // constructs NonMovable(10) in-place
+b.emplace("a", 10);    // NonMovable(10) in-place
 b.emplace("b", 20);
 auto m = b.build();    // OK — values never moved!
 assert(*m.at("a").data == 10);`}
@@ -307,15 +307,14 @@ assert(*m.at("a").data == 10);`}
           <p className="text-slate-300 leading-relaxed mb-4">
             <code className="text-emerald-400">find()</code>, <code className="text-emerald-400">at()</code>,{' '}
             <code className="text-emerald-400">contains()</code> — шаблонные по типу ключа.
-            Пользователь сам гарантирует, что Hash и Eq работают с совместимым типом ключа.
-            Никаких тегов <code className="text-slate-500">is_transparent</code> не нужно.
+            Пользователь сам гарантирует, что Hash и Eq работают с совместимым типом.
+            Никаких тегов <code className="text-slate-500">is_transparent</code>.
           </p>
           <CodeBlock
             language="cpp"
             code={`// Key = std::string, but hash/eq work with string_view
 struct string_hash {
     std::size_t operator()(std::string_view sv) const {
-        // xxh3 or whatever — same result for string and string_view
         return xxh3(sv.data(), sv.size());
     }
 };
@@ -329,51 +328,35 @@ struct string_eq {
 imm::immutable_map<std::string, int, string_hash, string_eq> map;
 // ... build map ...
 
-// Lookup by string_view — no temporary string allocation!
+// Lookup by string_view — no temporary string!
 std::string_view key = "hello";
 auto* val = map.find(key);         // OK
 int x = map.at(key);               // OK
 bool has = map.contains(key);      // OK
 
 // Also works with const char*:
-map.find("literal");               // OK — implicit conversion to string_view`}
+map.find("literal");               // OK — implicit → string_view`}
           />
           <div className="mt-4 bg-slate-900 border border-slate-800 rounded-lg p-5">
-            <h3 className="text-white font-semibold mb-2 text-sm">Why this works</h3>
-            <ul className="text-slate-300 text-sm space-y-2">
-              <li className="flex gap-2">
-                <span className="text-emerald-400 shrink-0">•</span>
-                <span>
-                  <code className="text-sky-300">hash(string_view)</code> и <code className="text-sky-300">hash(string)</code> дают
-                  одинаковый результат — пользователь гарантирует это реализацией
-                </span>
-              </li>
-              <li className="flex gap-2">
-                <span className="text-emerald-400 shrink-0">•</span>
-                <span>
-                  <code className="text-sky-300">std::string</code> неявно конвертируется в <code className="text-sky-300">string_view</code>,
-                  поэтому <code className="text-sky-300">eq(stored_key, query_key)</code> работает
-                </span>
-              </li>
-              <li className="flex gap-2">
-                <span className="text-emerald-400 shrink-0">•</span>
-                <span>
-                  Индексный слот находится по хэшу совместимого ключа — он совпадает с хэшем хранимого
-                </span>
-              </li>
-            </ul>
+            <h3 className="text-white font-semibold mb-2 text-sm">noexcept</h3>
+            <p className="text-slate-300 text-sm">
+              <code className="text-sky-300">find()</code> и <code className="text-sky-300">contains()</code> помечены{' '}
+              <code className="text-sky-300">noexcept</code> условно — если Hash и KeyEq noexcept.
+              <code className="text-sky-300">at()</code> не noexcept (может бросить <code className="text-sky-300">out_of_range</code>).
+            </p>
           </div>
         </Section>
 
         {/* Collect */}
         <Section id="collect" title="Collect from Range">
           <p className="text-slate-300 leading-relaxed mb-4">
-            Функция <code className="text-emerald-400">collect</code> строит карту из диапазона.
-            Поддерживаются forward_iterator и выше. Автоматически определяет, является ли .second кортежем.
+            Две функции: <code className="text-emerald-400">collect</code> (для пар key/value) и{' '}
+            <code className="text-emerald-400">collect_construct</code> (для пар key/tuple).
+            Никакого авто-детекта — выбор функции явный.
           </p>
           <CodeBlock
             language="cpp"
-            code={`// Case 1: range of {key, value} pairs
+            code={`// collect: range of {key, value} pairs
 std::vector<std::pair<std::string, int>> pairs = {
     {"one", 1}, {"two", 2}, {"three", 3}
 };
@@ -381,19 +364,16 @@ auto m1 = imm::collect<std::string, int>(pairs.begin(), pairs.end());
 // or:
 auto m1b = imm::collect<std::string, int>(pairs);
 
-// Case 2: range of {key, tuple<args...>} — Value constructed from tuple
+// collect_construct: range of {key, tuple<args...>}
 struct Point { int x, y; Point(int a, int b) : x(a), y(b) {} };
 
 std::vector<std::pair<std::string, std::tuple<int, int>>> data = {
     {"origin", {0, 0}},
     {"unit",   {1, 1}},
 };
-// Point is constructed as Point(0,0), Point(1,1)
-auto m2 = imm::collect<std::string, Point>(data.begin(), data.end());
-assert(m2.at("origin").x == 0);
-
-// Case 3: explicit collect_construct for tuple ranges
-auto m3 = imm::collect_construct<std::string, Point>(data);`}
+// Point constructed as Point(0,0), Point(1,1)
+auto m2 = imm::collect_construct<std::string, Point>(data);
+assert(m2.at("origin").x == 0);`}
           />
         </Section>
 
@@ -401,102 +381,40 @@ auto m3 = imm::collect_construct<std::string, Point>(data);`}
         <Section id="api" title="API Reference">
           <h3 className="text-lg font-semibold text-white mb-3">Template Parameters</h3>
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 mb-6">
-            <Param name="Key" type="typename" desc="Copyable, movable, hashable. Stored as const in pair." />
+            <Param name="Key" type="typename" desc="Copyable, movable. Stored as const in pair." />
             <Param name="Value" type="typename" desc="No move/copy required; constructed in-place" />
-            <Param name="Hash" type="= std::hash<Key>" desc="Hash functor. Must work with CompatibleKey too." />
+            <Param name="Hash" type="= std::hash<Key>" desc="Hash functor. Must work with CompatibleKey." />
             <Param name="KeyEq" type="= std::equal_to<Key>" desc="Equality functor. Must work with CompatibleKey." />
-            <Param name="Alloc" type="= std::allocator<std::byte>" desc="Allocator for raw memory" />
+            <Param name="Alloc" type="= std::allocator<std::byte>" desc="Allocator. EBO via private inheritance." />
           </div>
 
           <h3 className="text-lg font-semibold text-white mb-3">immutable_map</h3>
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 mb-6">
-            <Param name="size()" type="→ size_type" desc="Number of elements" />
-            <Param name="empty()" type="→ bool" desc="True if size() == 0" />
-            <Param name="find(key)" type="→ pair*" desc="Heterogeneous: template<CompatibleKey>. Returns pair pointer or nullptr." />
-            <Param name="at(key)" type="→ Value&" desc="Heterogeneous. Returns reference to value; throws if not found." />
-            <Param name="contains(key)" type="→ bool" desc="Heterogeneous. True if key is present." />
-            <Param name="begin() / end()" type="→ iterator" desc="Forward iterator, returns pair<const Key, Value>&" />
-            <Param name="cbegin() / cend()" type="→ const_iterator" desc="Const forward iterator" />
+            <Param name="size()" type="→ size_type" desc="noexcept" />
+            <Param name="empty()" type="→ bool" desc="noexcept" />
+            <Param name="get_allocator()" type="→ allocator_type" desc="noexcept" />
+            <Param name="find(key)" type="→ pair*" desc="template<CompatibleKey>. Conditional noexcept." />
+            <Param name="at(key)" type="→ Value&" desc="template<CompatibleKey>. Throws out_of_range." />
+            <Param name="contains(key)" type="→ bool" desc="template<CompatibleKey>. Conditional noexcept." />
+            <Param name="begin()/end()" type="→ iterator" desc="Forward iterator, returns pair&" />
           </div>
 
           <h3 className="text-lg font-semibold text-white mb-3">immutable_map_builder</h3>
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 mb-6">
-            <Param name="reserve(n)" type="void" desc="Allocate memory for n elements (call once, before emplace)" />
-            <Param name="emplace(key, args...)" type="void" desc="Construct pair in-place. Key forwarded, Value from args." />
-            <Param name="build()" type="→ immutable_map" desc="Build hash index, transfer ownership. Builder becomes empty." />
-            <Param name="size()" type="→ size_type" desc="Number of elements emplaced so far" />
+            <Param name="reserve(n)" type="void" desc="Throws: bad_alloc, logic_error" />
+            <Param name="emplace(key, args...)" type="void" desc="In-place. Rollback on Value ctor throw." />
+            <Param name="try_emplace(piecewise, kt, vt)" type="void" desc="Piecewise construction." />
+            <Param name="try_emplace(key, args...)" type="void" desc="Convenience overload." />
+            <Param name="build()" type="→ immutable_map" desc="Throws: logic_error, Hash exceptions." />
+            <Param name="size()" type="→ size_type" desc="noexcept" />
           </div>
 
           <h3 className="text-lg font-semibold text-white mb-3">Free Functions</h3>
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4">
-            <Param name="collect<K,V>(first, last)" type="→ immutable_map" desc="Build from iterator range. Auto-detects tuple values." />
-            <Param name="collect<K,V>(range)" type="→ immutable_map" desc="Build from range object (has begin/end)" />
-            <Param name="collect_construct<K,V>(first, last)" type="→ immutable_map" desc="Build from range of {key, tuple<args...>}" />
-          </div>
-        </Section>
-
-        {/* Examples */}
-        <Section id="examples" title="Complete Examples">
-          <div className="space-y-6">
-            <div>
-              <h3 className="text-white font-semibold mb-2">Iteration with structured bindings</h3>
-              <CodeBlock
-                language="cpp"
-                code={`for (auto&& [key, value] : map) {
-    std::cout << key << " → " << value << "\\n";
-    // key is const std::string&
-    // value is int& (mutable!)
-    value *= 2;  // OK
-}
-
-// Const iteration:
-const auto& cmap = map;
-for (auto&& [key, value] : cmap) {
-    // value is const int&
-    // value *= 2;  // ERROR
-}
-
-// Iterator is a real forward iterator:
-auto it = map.begin();
-auto it2 = it;   // copyable
-++it;
-assert(it != it2);`}
-              />
-            </div>
-            <div>
-              <h3 className="text-white font-semibold mb-2">Move and copy semantics</h3>
-              <CodeBlock
-                language="cpp"
-                code={`auto m1 = builder.build();
-auto m2 = std::move(m1);    // O(1), just pointer swap
-assert(m1.empty());          // moved-from state
-assert(m2.size() == 3);
-
-// Copy (only if Value is copy-constructible):
-auto m3 = m2;               // allocates new block, copies data
-assert(m3.size() == m2.size());
-
-// If Value is not copyable, copy is a compile error:
-// imm::immutable_map<int, NonMovable> m4 = m3;  // ERROR`}
-              />
-            </div>
-            <div>
-              <h3 className="text-white font-semibold mb-2">Custom allocator</h3>
-              <CodeBlock
-                language="cpp"
-                code={`template<typename T>
-struct MyAlloc : std::allocator<T> {
-    using std::allocator<T>::allocator;
-    template<typename U>
-    struct rebind { using other = MyAlloc<U>; };
-};
-
-imm::immutable_map<std::string, int,
-                   std::hash<std::string>,
-                   std::equal_to<std::string>,
-                   MyAlloc<std::byte>> map;`}
-              />
-            </div>
+            <Param name="collect<K,V>(first, last)" type="→ immutable_map" desc="From {key, value} range" />
+            <Param name="collect<K,V>(range)" type="→ immutable_map" desc="From range object" />
+            <Param name="collect_construct<K,V>(first, last)" type="→ immutable_map" desc="From {key, tuple<args...>} range" />
+            <Param name="collect_construct<K,V>(range)" type="→ immutable_map" desc="From range object" />
           </div>
         </Section>
 
@@ -519,7 +437,7 @@ imm::immutable_map<std::string, int,
 
       <footer className="border-t border-slate-800 py-8 text-center text-slate-500 text-sm">
         <p>immutable_map — C++17 header-only immutable hash map</p>
-        <p className="mt-1">Single allocation · Builder pattern · CRTP copy · Heterogeneous lookup · std::pair</p>
+        <p className="mt-1">allocator_traits · EBO · Exception safety · Heterogeneous lookup · CRTP copy</p>
       </footer>
     </div>
   );
