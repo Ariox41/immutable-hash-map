@@ -227,7 +227,7 @@ export default function App() {
           </div>
 
           <div className="mt-6 bg-slate-900 border border-slate-800 rounded-lg p-5">
-            <h3 className="text-white font-semibold mb-3">Exception safety in emplace</h3>
+            <h3 className="text-white font-semibold mb-3">Exception safety</h3>
             <p className="text-slate-300 text-sm mb-3">
               Используем <code className="text-sky-300">std::pair</code> piecewise constructor.
               Если конструктор Value бросает — pair не создан, ничего не нужно уничтожать.
@@ -235,15 +235,15 @@ export default function App() {
             </p>
             <CodeBlock
               language="cpp"
-              code={`// In emplace():
+              code={`// In try_emplace(piecewise, key_tuple, value_tuple):
 using pair_alloc    = typename storage_t::pair_alloc;
 using pair_alloc_tr = typename storage_t::pair_alloc_tr;
 pair_alloc pa(get_alloc());
 
 pair_alloc_tr::construct(pa, pair_at(size_),
                          std::piecewise_construct,
-                         std::forward_as_tuple(std::forward<K>(key)),
-                         std::forward_as_tuple(std::forward<Args>(args)...));
+                         std::move(key_tuple),
+                         std::move(value_tuple));
 ++size_;
 
 // If Value constructor throws inside piecewise_construct,
@@ -293,27 +293,53 @@ using storage_alloc =
         <Section id="builder" title="Builder Pattern">
           <p className="text-slate-300 leading-relaxed mb-4">
             Вставка через <code className="text-emerald-400">immutable_map_builder</code>.
-            Три метода вставки: <code className="text-sky-400">emplace</code>,{' '}
-            <code className="text-sky-400">try_emplace(piecewise, ...)</code>,{' '}
-            <code className="text-sky-400">try_emplace(key, args...)</code>.
+            Основной метод — <code className="text-sky-400">try_emplace(piecewise, ...)</code>,
+            остальные выражаются через него.
           </p>
+          <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 mb-4">
+            <h4 className="text-white font-semibold mb-2 text-sm">API hierarchy</h4>
+            <ul className="text-slate-300 text-sm space-y-1">
+              <li><code className="text-emerald-400">try_emplace(piecewise, key_tuple, value_tuple)</code> — core method</li>
+              <li className="pl-4 text-slate-500">↑</li>
+              <li><code className="text-sky-400">try_emplace(key, args...)</code> — convenience wrapper</li>
+              <li className="pl-4 text-slate-500">↑</li>
+              <li><code className="text-sky-400">emplace(key, args...)</code> — alias (standard compatibility)</li>
+              <li className="pl-4 text-slate-500">↑</li>
+              <li><code className="text-sky-400">insert(first, last)</code> — range of pairs</li>
+              <li><code className="text-sky-400">insert_construct(first, last)</code> — range of {'{'}key, tuple{'}'}</li>
+            </ul>
+          </div>
           <CodeBlock
             language="cpp"
             code={`imm::immutable_map_builder<std::string, int> builder;
 builder.reserve(100);                    // allocate once
-builder.emplace("alpha", 1);             // in-place construction
-builder.emplace("beta", 2);
 
-// try_emplace — piecewise construction
+// Core method: piecewise construction
 builder.try_emplace(std::piecewise_construct,
-                    std::forward_as_tuple("gamma"),
-                    std::forward_as_tuple(3));
+                    std::forward_as_tuple("alpha"),
+                    std::forward_as_tuple(1));
 
-// try_emplace — convenience overload
-builder.try_emplace("delta", 4);
+// Convenience: try_emplace(key, args...)
+builder.try_emplace("beta", 2);
+
+// Alias: emplace(key, args...) — same as try_emplace
+builder.emplace("gamma", 3);
+
+// Range insertion: insert(first, last)
+std::vector<std::pair<std::string, int>> pairs = {
+    {"delta", 4}, {"epsilon", 5}
+};
+builder.insert(pairs.begin(), pairs.end());
+
+// Range with tuple: insert_construct(first, last)
+struct Point { int x, y; Point(int a, int b) : x(a), y(b) {} };
+std::vector<std::pair<std::string, std::tuple<int, int>>> data = {
+    {"origin", {0, 0}}
+};
+builder.insert_construct(data.begin(), data.end());
 
 auto map = builder.build();              // build index, transfer ownership
-assert(map.size() == 4);
+assert(map.size() == 6);
 
 // Values are mutable:
 map.at("beta") = 42;
@@ -390,13 +416,14 @@ map.find("literal");               // OK — implicit → string_view`}
         {/* Collect */}
         <Section id="collect" title="Collect from Range">
           <p className="text-slate-300 leading-relaxed mb-4">
-            Две функции: <code className="text-emerald-400">collect</code> (для пар key/value) и{' '}
-            <code className="text-emerald-400">collect_construct</code> (для пар key/tuple).
-            Никакого авто-детекта — выбор функции явный.
+            Функции <code className="text-emerald-400">collect</code> и{' '}
+            <code className="text-emerald-400">collect_construct</code> — convenience wrappers
+            над <code className="text-sky-400">insert</code> и <code className="text-sky-400">insert_construct</code>.
           </p>
           <CodeBlock
             language="cpp"
             code={`// collect: range of {key, value} pairs
+// Internally: builder.reserve(n); builder.insert(first, last); builder.build();
 std::vector<std::pair<std::string, int>> pairs = {
     {"one", 1}, {"two", 2}, {"three", 3}
 };
@@ -405,6 +432,7 @@ auto m1 = imm::collect<std::string, int>(pairs.begin(), pairs.end());
 auto m1b = imm::collect<std::string, int>(pairs);
 
 // collect_construct: range of {key, tuple<args...>}
+// Internally: builder.reserve(n); builder.insert_construct(first, last); builder.build();
 struct Point { int x, y; Point(int a, int b) : x(a), y(b) {} };
 
 std::vector<std::pair<std::string, std::tuple<int, int>>> data = {
@@ -415,6 +443,11 @@ std::vector<std::pair<std::string, std::tuple<int, int>>> data = {
 auto m2 = imm::collect_construct<std::string, Point>(data);
 assert(m2.at("origin").x == 0);`}
           />
+          <p className="text-slate-300 leading-relaxed mt-4">
+            Это соответствует стандартным контейнерам: <code className="text-sky-400">std::map::insert(first, last)</code>{' '}
+            вставляет диапазон, а <code className="text-sky-400">collect</code> — это <code className="text-sky-400">insert</code> +{' '}
+            <code className="text-sky-400">build</code> для immutable контейнера.
+          </p>
         </Section>
 
         {/* API */}
@@ -442,9 +475,11 @@ assert(m2.at("origin").x == 0);`}
           <h3 className="text-lg font-semibold text-white mb-3">immutable_map_builder</h3>
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 mb-6">
             <Param name="reserve(n)" type="void" desc="Throws: bad_alloc, logic_error" />
-            <Param name="emplace(key, args...)" type="void" desc="In-place. Rollback on Value ctor throw." />
-            <Param name="try_emplace(piecewise, kt, vt)" type="void" desc="Piecewise construction." />
-            <Param name="try_emplace(key, args...)" type="void" desc="Convenience overload." />
+            <Param name="try_emplace(piecewise, kt, vt)" type="void" desc="Core method. Piecewise construction." />
+            <Param name="try_emplace(key, args...)" type="void" desc="Convenience wrapper over piecewise." />
+            <Param name="emplace(key, args...)" type="void" desc="Alias for try_emplace (standard compat)." />
+            <Param name="insert(first, last)" type="void" desc="Range of pairs. Uses emplace internally." />
+            <Param name="insert_construct(first, last)" type="void" desc="Range of {key, tuple}. Uses emplace internally." />
             <Param name="build()" type="→ immutable_map" desc="Throws: logic_error, Hash exceptions." />
             <Param name="size()" type="→ size_type" desc="noexcept" />
           </div>

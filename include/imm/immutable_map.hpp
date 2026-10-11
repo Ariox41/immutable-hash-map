@@ -587,28 +587,9 @@ public:
         storage_.allocate(n, storage_.index_size_);
     }
 
-    template <typename K, typename... Args>
-    void emplace(K&& key, Args&&... args) {
-        if (size_ >= capacity_) {
-            throw std::logic_error(
-                "immutable_map_builder::emplace: capacity exceeded, "
-                "call reserve() first");
-        }
-
-        // Construct pair via piecewise constructor.
-        // If Value constructor throws, pair is not created — no cleanup needed.
-        using pair_alloc    = typename storage_t::pair_alloc;
-        using pair_alloc_tr = typename storage_t::pair_alloc_tr;
-        pair_alloc pa(storage_.get_alloc());
-
-        pair_alloc_tr::construct(pa, storage_.pair_at(size_),
-                                 std::piecewise_construct,
-                                 std::forward_as_tuple(std::forward<K>(key)),
-                                 std::forward_as_tuple(std::forward<Args>(args)...));
-
-        ++size_;
-    }
-
+    // ----- Core insertion method -----
+    // try_emplace with piecewise_construct is the fundamental operation.
+    // All other insertion methods are expressed through it.
     template <typename... KeyArgs, typename... ValueArgs>
     void try_emplace(std::piecewise_construct_t,
                      std::tuple<KeyArgs...> key_args,
@@ -619,8 +600,6 @@ public:
                 "call reserve() first");
         }
 
-        // Construct pair via piecewise constructor.
-        // If Value constructor throws, pair is not created — no cleanup needed.
         using pair_alloc    = typename storage_t::pair_alloc;
         using pair_alloc_tr = typename storage_t::pair_alloc_tr;
         pair_alloc pa(storage_.get_alloc());
@@ -631,6 +610,44 @@ public:
                                  std::move(value_args));
 
         ++size_;
+    }
+
+    // ----- Convenience wrappers -----
+    
+    // try_emplace(key, args...) — convenience wrapper
+    template <typename K, typename... ValueArgs>
+    void try_emplace(K&& key, ValueArgs&&... value_args) {
+        try_emplace(std::piecewise_construct,
+                    std::forward_as_tuple(std::forward<K>(key)),
+                    std::forward_as_tuple(std::forward<ValueArgs>(value_args)...));
+    }
+
+    // emplace(key, args...) — alias for try_emplace (standard compatibility)
+    template <typename K, typename... Args>
+    void emplace(K&& key, Args&&... args) {
+        try_emplace(std::forward<K>(key), std::forward<Args>(args)...);
+    }
+
+    // ----- Range insertion -----
+    
+    // insert(first, last) — insert range of pairs
+    template <typename ForwardIt>
+    void insert(ForwardIt first, ForwardIt last) {
+        for (; first != last; ++first) {
+            emplace((*first).first, (*first).second);
+        }
+    }
+
+    // insert_construct(first, last) — insert range of {key, tuple<args...>}
+    template <typename ForwardIt>
+    void insert_construct(ForwardIt first, ForwardIt last) {
+        for (; first != last; ++first) {
+            std::apply(
+                [&](auto&&... args) {
+                    emplace((*first).first, std::forward<decltype(args)>(args)...);
+                },
+                (*first).second);
+        }
     }
 
     template <typename K, typename... ValueArgs>
@@ -680,11 +697,7 @@ collect(ForwardIt first, ForwardIt last) {
     const auto n = static_cast<std::size_t>(std::distance(first, last));
     immutable_map_builder<Key, Value, Hash, KeyEq, Alloc> builder;
     builder.reserve(n);
-
-    for (; first != last; ++first) {
-        builder.emplace(Key((*first).first), (*first).second);
-    }
-
+    builder.insert(first, last);
     return builder.build();
 }
 
@@ -711,16 +724,7 @@ collect_construct(ForwardIt first, ForwardIt last) {
     const auto n = static_cast<std::size_t>(std::distance(first, last));
     immutable_map_builder<Key, Value, Hash, KeyEq, Alloc> builder;
     builder.reserve(n);
-
-    for (; first != last; ++first) {
-        std::apply(
-            [&](auto&&... args) {
-                builder.emplace(Key((*first).first),
-                                std::forward<decltype(args)>(args)...);
-            },
-            (*first).second);
-    }
-
+    builder.insert_construct(first, last);
     return builder.build();
 }
 
