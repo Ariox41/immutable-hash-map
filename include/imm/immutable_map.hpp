@@ -145,11 +145,20 @@ protected:
         }
     }
 
-    // ----- element lifetime -----
+    // ----- element lifetime via allocator_traits -----
+    // We use rebind_alloc<pair_type> and allocator_traits::construct/destroy
+    // for proper allocator-aware construction/destruction.
+    // Note: our layout (reinterpret_cast + manual offsets) is not compatible
+    // with fancy pointers. For full fancy pointer support, the layout would
+    // need to use pointer_traits and avoid reinterpret_cast.
+    using pair_alloc    = typename alloc_traits::template rebind_alloc<pair_type>;
+    using pair_alloc_tr = std::allocator_traits<pair_alloc>;
+
     void destroy_elements() noexcept {
+        pair_alloc pa(get_alloc());
         pair_type* p = pairs();
         for (std::size_t i = size_; i > 0; --i) {
-            p[i - 1].~pair_type();
+            pair_alloc_tr::destroy(pa, p + (i - 1));
         }
     }
 
@@ -269,15 +278,17 @@ protected:
             self.size_       = n;
             self.index_size_ = m;
 
+            using pair_alloc    = typename Derived::storage_t::pair_alloc;
+            using pair_alloc_tr = typename Derived::storage_t::pair_alloc_tr;
+            pair_alloc pa(self.get_alloc());
+
             auto* dst = self.pairs();
             const auto* src = other.pairs();
             std::size_t i = 0;
             try {
                 for (; i < n; ++i) {
-                    ::new (static_cast<void*>(dst + i))
-                        std::pair<const typename Derived::key_type,
-                                  typename Derived::mapped_type>(
-                            src[i].first, src[i].second);
+                    pair_alloc_tr::construct(pa, dst + i,
+                                             src[i].first, src[i].second);
                 }
             } catch (...) {
                 self.size_ = i;
@@ -550,6 +561,15 @@ public:
                 "call reserve() first");
         }
 
+        // Construct Key and Value separately via allocator_traits.
+        // We cannot use allocator_traits::construct for the whole pair because
+        // pair<const Key, Value> doesn't support forwarding construction,
+        // and we need manual rollback if Value constructor throws.
+        using key_alloc    = typename alloc_traits::template rebind_alloc<Key>;
+        using key_alloc_tr = std::allocator_traits<key_alloc>;
+        using val_alloc    = typename alloc_traits::template rebind_alloc<Value>;
+        using val_alloc_tr = std::allocator_traits<val_alloc>;
+
         static constexpr std::size_t val_offset =
             detail::align_up(sizeof(Key), alignof(Value));
 
@@ -557,13 +577,15 @@ public:
         Key* key_ptr = reinterpret_cast<Key*>(raw);
         Value* val_ptr = reinterpret_cast<Value*>(raw + val_offset);
 
-        ::new (static_cast<void*>(key_ptr)) Key(std::forward<K>(key));
+        key_alloc ka(get_alloc());
+        val_alloc va(get_alloc());
+
+        key_alloc_tr::construct(ka, key_ptr, std::forward<K>(key));
 
         try {
-            ::new (static_cast<void*>(val_ptr))
-                Value(std::forward<Args>(args)...);
+            val_alloc_tr::construct(va, val_ptr, std::forward<Args>(args)...);
         } catch (...) {
-            key_ptr->~Key();
+            key_alloc_tr::destroy(ka, key_ptr);
             throw;
         }
 
@@ -580,6 +602,11 @@ public:
                 "call reserve() first");
         }
 
+        using key_alloc    = typename alloc_traits::template rebind_alloc<Key>;
+        using key_alloc_tr = std::allocator_traits<key_alloc>;
+        using val_alloc    = typename alloc_traits::template rebind_alloc<Value>;
+        using val_alloc_tr = std::allocator_traits<val_alloc>;
+
         static constexpr std::size_t val_offset =
             detail::align_up(sizeof(Key), alignof(Value));
 
@@ -587,14 +614,17 @@ public:
         Key* key_ptr = reinterpret_cast<Key*>(raw);
         Value* val_ptr = reinterpret_cast<Value*>(raw + val_offset);
 
-        ::new (static_cast<void*>(key_ptr))
-            Key(std::make_from_tuple<Key>(std::move(key_args)));
+        key_alloc ka(get_alloc());
+        val_alloc va(get_alloc());
+
+        key_alloc_tr::construct(ka, key_ptr,
+                                std::make_from_tuple<Key>(std::move(key_args)));
 
         try {
-            ::new (static_cast<void*>(val_ptr))
-                Value(std::make_from_tuple<Value>(std::move(value_args)));
+            val_alloc_tr::construct(va, val_ptr,
+                                    std::make_from_tuple<Value>(std::move(value_args)));
         } catch (...) {
-            key_ptr->~Key();
+            key_alloc_tr::destroy(ka, key_ptr);
             throw;
         }
 

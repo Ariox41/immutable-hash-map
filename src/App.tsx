@@ -225,23 +225,32 @@ export default function App() {
           <div className="mt-6 bg-slate-900 border border-slate-800 rounded-lg p-5">
             <h3 className="text-white font-semibold mb-3">Exception safety in emplace</h3>
             <p className="text-slate-300 text-sm mb-3">
-              Если конструктор Value бросает исключение, уже сконструированный Key уничтожается.
-              <code className="text-sky-300">size_</code> не инкрементируется. Размещение через raw memory
-              (без <code className="text-sky-300">const_cast</code> на <code className="text-sky-300">pair::first</code>).
+              Если конструктор Value бросает исключение, уже сконструированный Key уничтожается через{' '}
+              <code className="text-sky-300">allocator_traits::destroy</code>.
+              <code className="text-sky-300">size_</code> не инкрементируется. Key и Value конструируются
+              через <code className="text-sky-300">allocator_traits::construct</code> с rebound аллокаторами.
             </p>
             <CodeBlock
               language="cpp"
               code={`// In emplace():
+using key_alloc = typename alloc_traits::template rebind_alloc<Key>;
+using key_alloc_tr = std::allocator_traits<key_alloc>;
+using val_alloc = typename alloc_traits::template rebind_alloc<Value>;
+using val_alloc_tr = std::allocator_traits<val_alloc>;
+
 char* raw = reinterpret_cast<char*>(pairs() + size_);
 Key*   key_ptr = reinterpret_cast<Key*>(raw);
 Value* val_ptr = reinterpret_cast<Value*>(
     raw + align_up(sizeof(Key), alignof(Value)));
 
-::new (key_ptr) Key(std::forward<K>(key));
+key_alloc ka(get_alloc());
+val_alloc va(get_alloc());
+
+key_alloc_tr::construct(ka, key_ptr, std::forward<K>(key));
 try {
-    ::new (val_ptr) Value(std::forward<Args>(args)...);
+    val_alloc_tr::construct(va, val_ptr, std::forward<Args>(args)...);
 } catch (...) {
-    key_ptr->~Key();   // rollback
+    key_alloc_tr::destroy(ka, key_ptr);   // rollback
     throw;
 }
 ++size_;`}
